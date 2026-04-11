@@ -34,7 +34,7 @@ export function StatusBar() {
         </>
       )}
 
-      <span className="ml-auto">Ferrobase v0.1.0</span>
+      <span className="ml-auto">Ferrobase v0.1.1</span>
     </div>
   );
 }

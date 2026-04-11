@@ -7,7 +7,7 @@ interface AboutDialogProps {
   onClose: () => void;
 }
 
-const APP_VERSION = '0.1.0';
+const APP_VERSION = '0.1.1';
 const BUILD_DATE = '2026-04-10';
 const GITHUB_URL = 'https://github.com/derekzhan/Ferrobase';
 const CONTACT_EMAIL = 'weichun.zhan@gmail.com';
