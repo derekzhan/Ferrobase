@@ -57,8 +57,9 @@ jobs:
           sudo apt-get install -y nsis lld llvm
           cargo install --locked cargo-xwin
 
-      - name: Validate Apple signing secrets
-        if: runner.os == 'macOS' && secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.KEYCHAIN_PASSWORD != '' && secrets.APPLE_API_ISSUER != '' && secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_P8 != ''
+      - name: Configure Apple signing
+        id: apple_signing
+        if: runner.os == 'macOS'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -83,12 +84,15 @@ jobs:
           done
 
           if [ "${#missing[@]}" -gt 0 ]; then
-            echo "Missing required macOS signing secrets: ${missing[*]}"
-            exit 1
+            echo "Apple signing secrets are not fully configured. Building unsigned macOS artifacts."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
       - name: Import Apple Developer certificate
-        if: runner.os == 'macOS' && secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.KEYCHAIN_PASSWORD != '' && secrets.APPLE_API_ISSUER != '' && secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_P8 != ''
+        if: runner.os == 'macOS' && steps.apple_signing.outputs.enabled == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -112,7 +116,7 @@ jobs:
           security find-identity -v -p codesigning "$RUNNER_TEMP/build.keychain"
 
       - name: Resolve Apple signing identity
-        if: runner.os == 'macOS' && secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.KEYCHAIN_PASSWORD != '' && secrets.APPLE_API_ISSUER != '' && secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_P8 != ''
+        if: runner.os == 'macOS' && steps.apple_signing.outputs.enabled == 'true'
         run: |
           CERT_ID=$(
             security find-identity -v -p codesigning "$RUNNER_TEMP/build.keychain" |
@@ -129,7 +133,7 @@ jobs:
           echo "APPLE_SIGNING_IDENTITY=$CERT_ID" >> "$GITHUB_ENV"
 
       - name: Write App Store Connect API key
-        if: runner.os == 'macOS' && secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.KEYCHAIN_PASSWORD != '' && secrets.APPLE_API_ISSUER != '' && secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_P8 != ''
+        if: runner.os == 'macOS' && steps.apple_signing.outputs.enabled == 'true'
         env:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
