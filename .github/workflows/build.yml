@@ -1,0 +1,83 @@
+name: Release Ferrobase
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Intel
+            runner: macos-15-intel
+            rust_targets: x86_64-apple-darwin
+            tauri_args: --target x86_64-apple-darwin
+          - name: macOS Apple Silicon
+            runner: macos-15
+            rust_targets: aarch64-apple-darwin
+            tauri_args: --target aarch64-apple-darwin
+          - name: Windows x64
+            runner: ubuntu-latest
+            rust_targets: x86_64-pc-windows-msvc
+            tauri_args: --runner cargo-xwin --target x86_64-pc-windows-msvc
+          - name: Windows ARM64
+            runner: ubuntu-latest
+            rust_targets: aarch64-pc-windows-msvc
+            tauri_args: --runner cargo-xwin --target aarch64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux cross-compilation dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nsis lld llvm
+          cargo install --locked cargo-xwin
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build and upload release assets
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Ferrobase ${{ github.ref_name }}
+          releaseBody: |
+            Automated release for ${{ github.ref_name }}.
+
+            Included artifacts:
+            - macOS Intel
+            - macOS Apple Silicon
+            - Windows x64
+            - Windows ARM64
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.tauri_args }}

@@ -1,0 +1,39 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Option 2: Dark background + glowing iron/steel DB shape + orange accent -->
+  <defs>
+    <linearGradient id="bg2" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1E293B"/>
+      <stop offset="100%" stop-color="#0F172A"/>
+    </linearGradient>
+    <linearGradient id="glow2" x1="256" y1="80" x2="256" y2="432" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#60A5FA"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+    <linearGradient id="bolt2" x1="240" y1="160" x2="280" y2="360" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F59E0B"/>
+      <stop offset="100%" stop-color="#EF4444"/>
+    </linearGradient>
+    <filter id="glow-filter">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <!-- Background -->
+  <rect width="512" height="512" rx="110" fill="url(#bg2)"/>
+  <!-- Subtle border -->
+  <rect x="4" y="4" width="504" height="504" rx="108" fill="none" stroke="#3B82F6" stroke-width="2" opacity="0.3"/>
+  <!-- Database shape with glow -->
+  <g filter="url(#glow-filter)" opacity="0.9">
+    <ellipse cx="256" cy="140" rx="120" ry="42" fill="url(#glow2)" opacity="0.9"/>
+    <path d="M136 140v70c0 23.2 53.7 42 120 42s120-18.8 120-42V140" fill="url(#glow2)" opacity="0.25"/>
+    <ellipse cx="256" cy="210" rx="120" ry="42" fill="url(#glow2)" opacity="0.15" stroke="#60A5FA" stroke-width="1.5"/>
+    <path d="M136 210v70c0 23.2 53.7 42 120 42s120-18.8 120-42V210" fill="url(#glow2)" opacity="0.2"/>
+    <ellipse cx="256" cy="280" rx="120" ry="42" fill="url(#glow2)" opacity="0.15" stroke="#60A5FA" stroke-width="1.5"/>
+    <path d="M136 280v70c0 23.2 53.7 42 120 42s120-18.8 120-42V280" fill="url(#glow2)" opacity="0.2"/>
+    <ellipse cx="256" cy="350" rx="120" ry="42" fill="url(#glow2)" opacity="0.9"/>
+  </g>
+  <!-- Lightning bolt - fire gradient -->
+  <path d="M270 165l-36 58h28l-7 58 44-66h-32z" fill="url(#bolt2)" filter="url(#glow-filter)"/>
+  <!-- "Fe" text (Iron element symbol) -->
+  <text x="256" y="430" text-anchor="middle" fill="#94A3B8" font-size="36" font-weight="700" font-family="system-ui" letter-spacing="4" opacity="0.6">Fe</text>
+</svg>

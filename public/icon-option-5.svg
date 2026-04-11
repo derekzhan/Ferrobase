@@ -1,0 +1,42 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Option 5: Hexagonal tech style — modern, cyberpunk feel -->
+  <defs>
+    <linearGradient id="bg5" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#1F2937"/>
+    </linearGradient>
+    <linearGradient id="accent5" x1="200" y1="80" x2="320" y2="432" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+    <linearGradient id="bolt5" x1="0" y1="0" x2="0" y2="1" gradientUnits="objectBoundingBox">
+      <stop offset="0%" stop-color="#F59E0B"/>
+      <stop offset="100%" stop-color="#F97316"/>
+    </linearGradient>
+    <filter id="neon5">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <!-- Background -->
+  <rect width="512" height="512" rx="110" fill="url(#bg5)"/>
+  <!-- Hexagonal border ring -->
+  <polygon points="256,50 430,130 430,382 256,462 82,382 82,130" fill="none" stroke="url(#accent5)" stroke-width="3" opacity="0.3"/>
+  <polygon points="256,80 405,148 405,364 256,432 107,364 107,148" fill="none" stroke="url(#accent5)" stroke-width="1.5" opacity="0.15"/>
+  <!-- DB cylinders with neon outline -->
+  <g filter="url(#neon5)">
+    <ellipse cx="256" cy="155" rx="105" ry="36" fill="none" stroke="url(#accent5)" stroke-width="3"/>
+    <ellipse cx="256" cy="155" rx="105" ry="36" fill="url(#accent5)" opacity="0.15"/>
+    <path d="M151 155v60c0 19.9 47 36 105 36s105-16.1 105-36V155" fill="url(#accent5)" opacity="0.08" stroke="url(#accent5)" stroke-width="2"/>
+    <ellipse cx="256" cy="215" rx="105" ry="36" fill="none" stroke="url(#accent5)" stroke-width="2" opacity="0.5"/>
+    <path d="M151 215v60c0 19.9 47 36 105 36s105-16.1 105-36V215" fill="url(#accent5)" opacity="0.08" stroke="url(#accent5)" stroke-width="2"/>
+    <ellipse cx="256" cy="275" rx="105" ry="36" fill="none" stroke="url(#accent5)" stroke-width="2" opacity="0.5"/>
+    <path d="M151 275v55c0 19.9 47 36 105 36s105-16.1 105-36V275" fill="url(#accent5)" opacity="0.08" stroke="url(#accent5)" stroke-width="2"/>
+    <ellipse cx="256" cy="330" rx="105" ry="36" fill="none" stroke="url(#accent5)" stroke-width="3"/>
+    <ellipse cx="256" cy="330" rx="105" ry="36" fill="url(#accent5)" opacity="0.15"/>
+  </g>
+  <!-- Lightning bolt -->
+  <path d="M272 172l-38 62h30l-8 62 46-70h-34z" fill="url(#bolt5)" filter="url(#neon5)"/>
+  <!-- Fe badge -->
+  <text x="256" y="428" text-anchor="middle" fill="url(#accent5)" font-size="32" font-weight="800" font-family="system-ui" letter-spacing="6" filter="url(#neon5)">FERROBASE</text>
+</svg>
