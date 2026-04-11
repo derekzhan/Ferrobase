@@ -165,6 +165,11 @@ jobs:
             - macOS Apple Silicon
             - Windows x64
             - Windows ARM64
+
+            macOS note:
+            Current macOS builds are not code signed or notarized unless Apple signing secrets are configured.
+            If macOS reports that Ferrobase is damaged, move the app to /Applications and run:
+            xattr -dr com.apple.quarantine /Applications/Ferrobase.app
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.tauri_args }}

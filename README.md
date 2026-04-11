@@ -133,6 +133,18 @@ npm run tauri build
 
 The `.dmg` (macOS), `.msi` (Windows), or `.AppImage` (Linux) installer will be in `src-tauri/target/release/bundle/`.
 
+#### macOS Notice
+
+Current macOS releases are not code signed or notarized yet. On first launch, macOS may show a warning such as `"Ferrobase" is damaged and can't be opened`.
+
+If you trust the downloaded app, move `Ferrobase.app` into `/Applications` and run:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Ferrobase.app
+```
+
+Then launch the app again.
+
 ### Screenshots
 
 #### Main Workspace
@@ -284,6 +296,18 @@ npm run tauri build
 ```
 
 安装包位于 `src-tauri/target/release/bundle/` 目录下（macOS 为 `.dmg`，Windows 为 `.msi`，Linux 为 `.AppImage`）。
+
+#### macOS 说明
+
+当前发布的 macOS 安装包还没有做代码签名和 notarization。首次打开时，macOS 可能会提示 `"Ferrobase" is damaged and can't be opened`。
+
+如果你确认安装包来源可信，请先将 `Ferrobase.app` 拖到 `/Applications`，然后执行：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Ferrobase.app
+```
+
+之后再重新打开应用。
 
 ### 截图
 
