@@ -171,12 +171,6 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 MIT License — see [LICENSE](LICENSE) for details.
 
-### Contact
-
-- **Author**: Derek Zhan
-- **Email**: weichun.zhan@gmail.com
-- **GitHub**: [https://github.com/derekzhan/Ferrobase](https://github.com/derekzhan/Ferrobase)
-
 ---
 
 <a id="中文"></a>
@@ -328,9 +322,3 @@ npm run tauri build
 ### 开源协议
 
 MIT License — 详见 [LICENSE](LICENSE)。
-
-### 联系方式
-
-- **作者**: Derek Zhan (詹伟春)
-- **邮箱**: weichun.zhan@gmail.com
-- **GitHub**: [https://github.com/derekzhan/Ferrobase](https://github.com/derekzhan/Ferrobase)
