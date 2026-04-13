@@ -7,6 +7,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type { QueryResult } from '../../types';
 import { extractErrorMessage } from '../../lib/utils';
 import { useSettingsStore } from '../../stores';
+import { formatMongoValue, parseMongoInputValue, shouldUseMongoJsonEditor } from './mongoValue';
 
 interface Props {
   results: QueryResult;
@@ -107,10 +108,13 @@ export function RecordView({
 
   const startEdit = (colIdx: number) => {
     if (!hasPk) return;
+    if (dbType === 'mongodb' && results.columns[colIdx].name === '_id') return;
     const val = getCellVal(colIdx);
     setEditingField(colIdx);
     if (val === null || val === undefined) {
       setEditValue('');
+    } else if (dbType === 'mongodb' && !shouldUseMongoJsonEditor(val, results.columns[colIdx].dataType?.toLowerCase() ?? '')) {
+      setEditValue(formatMongoValue(val));
     } else if (typeof val === 'object') {
       setEditValue(JSON.stringify(val, null, 2));
     } else {
@@ -123,7 +127,12 @@ export function RecordView({
     if (editingField === null || !row) return;
     const colName = results.columns[editingField].name;
     const originalVal = row[editingField];
-    let newVal: unknown = editValue.trim().toUpperCase() === 'NULL' ? null : editValue;
+    const colDataType = results.columns[editingField].dataType?.toLowerCase() ?? '';
+    let newVal: unknown = editValue.trim().toUpperCase() === 'NULL'
+      ? null
+      : dbType === 'mongodb'
+        ? parseMongoInputValue(editValue, colDataType)
+        : editValue;
 
     const unchanged =
       (newVal === null && (originalVal === null || originalVal === undefined)) ||
@@ -136,7 +145,7 @@ export function RecordView({
       return next;
     });
     setEditingField(null);
-  }, [editingField, editValue, row, results]);
+  }, [dbType, editingField, editValue, row, results]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Escape') {
@@ -219,6 +228,9 @@ export function RecordView({
       return <span className={val ? 'text-green-400' : 'text-red-400'}>{String(val)}</span>;
     }
     if (typeof val === 'object') {
+      if (dbType === 'mongodb') {
+        return <span className="text-purple-400 font-mono text-[11px]">{formatMongoValue(val)}</span>;
+      }
       return <span className="text-purple-400 font-mono text-[11px]">{JSON.stringify(val)}</span>;
     }
     return <span className="text-[var(--text-primary)]">{String(val)}</span>;

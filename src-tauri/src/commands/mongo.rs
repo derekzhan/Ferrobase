@@ -1,6 +1,6 @@
 use tauri::State;
 use serde::{Deserialize, Serialize};
-use mongodb::bson::Document;
+use mongodb::bson::{self, Bson, Document};
 use crate::pool::{ConnectionRegistry, DatabaseConnection};
 use crate::error::AppError;
 use crate::db::mongodb_driver;
@@ -16,15 +16,9 @@ pub struct MongoQueryOptions {
 }
 
 fn json_to_bson_doc(val: serde_json::Value) -> Option<Document> {
-    if let serde_json::Value::Object(map) = val {
-        let mut doc = Document::new();
-        for (k, v) in map {
-            let bson_val = mongodb::bson::to_bson(&v).ok()?;
-            doc.insert(k, bson_val);
-        }
-        Some(doc)
-    } else {
-        None
+    match mongodb_driver::serde_json_to_bson(val)? {
+        Bson::Document(doc) => Some(doc),
+        _ => None,
     }
 }
 
@@ -146,11 +140,9 @@ pub async fn get_collection_indexes(
         .map_err(|e| AppError::Database(e.to_string()))?;
     let mut indexes = Vec::new();
     while let Some(idx) = cursor.try_next().await.map_err(|e| AppError::Database(e.to_string()))? {
-        let json_str = serde_json::to_string(&idx)
+        let bson = bson::to_bson(&idx)
             .map_err(|e| AppError::Serialization(e.to_string()))?;
-        let val: serde_json::Value = serde_json::from_str(&json_str)
-            .map_err(|e| AppError::Serialization(e.to_string()))?;
-        indexes.push(val);
+        indexes.push(mongodb_driver::bson_to_json_value(bson));
     }
     Ok(indexes)
 }

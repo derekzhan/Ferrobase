@@ -145,6 +145,15 @@ pub async fn get_table_columns(
             db::postgres::get_columns(pool, schema_name, &table).await
         }
         DatabaseConnection::Sqlite(pool) => db::sqlite::get_columns(pool, &table).await,
+        DatabaseConnection::Mongodb(client) => {
+            db::mongodb_driver::infer_collection_columns_owned(
+                client.clone(),
+                database,
+                table,
+                50,
+            )
+            .await
+        }
         _ => Err(AppError::UnsupportedOperation(
             "Column introspection not supported for this database type".to_string(),
         )),
@@ -295,11 +304,24 @@ async fn get_table_data_preview_impl(
             Ok(result)
         }
         DatabaseConnection::Mongodb(client) => {
+            let filter = where_clause
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(|input| {
+                    db::mongodb_driver::parse_shell_document(input).ok_or_else(|| {
+                        AppError::Query(
+                            "Invalid MongoDB filter. Example: { trackNumber: 'QA1106CP004' }"
+                                .to_string(),
+                        )
+                    })
+                })
+                .transpose()?;
+
             let docs = db::mongodb_driver::query_collection_owned(
                 client,
                 database.clone(),
                 table.clone(),
-                None,
+                filter,
                 None,
                 None,
                 limit as i64,
@@ -323,11 +345,57 @@ async fn get_table_data_preview_impl(
 
             let columns: Vec<crate::models::ColumnInfo> = all_keys
                 .iter()
-                .map(|k| crate::models::ColumnInfo {
-                    name: k.clone(),
-                    data_type: "json".to_string(),
-                    nullable: true,
-                    is_primary_key: k == "_id",
+                .map(|k| {
+                    let inferred_type = docs
+                        .iter()
+                        .filter_map(|doc| match doc {
+                            serde_json::Value::Object(map) => map.get(k),
+                            _ => None,
+                        })
+                        .map(db::mongodb_driver::mongo_value_type_name)
+                        .fold(None::<String>, |current, next| {
+                            let merged = match current {
+                                None => next.to_string(),
+                                Some(existing) if existing == next || next == "null" => existing,
+                                Some(existing) if existing == "null" => next.to_string(),
+                                Some(existing)
+                                    if existing == "int" && next == "long" =>
+                                {
+                                    "long".to_string()
+                                }
+                                Some(existing)
+                                    if existing == "long" && next == "int" =>
+                                {
+                                    "long".to_string()
+                                }
+                                Some(existing)
+                                    if (existing == "int"
+                                        || existing == "long"
+                                        || existing == "double")
+                                        && (next == "int"
+                                            || next == "long"
+                                            || next == "double") =>
+                                {
+                                    if existing == "double" || next == "double" {
+                                        "double".to_string()
+                                    } else if existing == "long" || next == "long" {
+                                        "long".to_string()
+                                    } else {
+                                        "int".to_string()
+                                    }
+                                }
+                                Some(_) => "json".to_string(),
+                            };
+                            Some(merged)
+                        })
+                        .unwrap_or_else(|| "null".to_string());
+
+                    crate::models::ColumnInfo {
+                        name: k.clone(),
+                        data_type: inferred_type,
+                        nullable: true,
+                        is_primary_key: k == "_id",
+                    }
                 })
                 .collect();
 
@@ -354,7 +422,11 @@ async fn get_table_data_preview_impl(
                 row_count,
                 affected_rows: 0,
                 execution_time_ms: 0,
-                query: format!("db.{}.find().limit({})", table, limit),
+                query: where_clause
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|filter| format!("db.{}.find({}).skip({}).limit({})", table, filter, offset, limit))
+                    .unwrap_or_else(|| format!("db.{}.find().skip({}).limit({})", table, offset, limit)),
             })
         }
         DatabaseConnection::Redis(_) => Err(AppError::UnsupportedOperation(

@@ -244,6 +244,20 @@ const MONGODB_SNIPPETS = [
   { label: 'db.collection.distinct', detail: 'Get distinct values', insertText: "db.${1:collection}.distinct('${2:field}')" },
 ];
 
+const MONGODB_COLLECTION_METHODS = [
+  { label: 'find', detail: 'Find documents', insertText: 'find({${1:}}).limit(${2:100})' },
+  { label: 'findOne', detail: 'Find a single document', insertText: 'findOne({${1:}})' },
+  { label: 'aggregate', detail: 'Aggregation pipeline', insertText: 'aggregate([{\n  \\$match: { ${1:field}: ${2:value} }\n}])' },
+  { label: 'sort', detail: 'Sort documents', insertText: 'sort({ ${1:field}: ${2:-1} })' },
+  { label: 'project', detail: 'Project fields', insertText: 'project({ ${1:field}: 1 })' },
+  { label: 'limit', detail: 'Limit result count', insertText: 'limit(${1:100})' },
+  { label: 'skip', detail: 'Skip result count', insertText: 'skip(${1:0})' },
+  { label: 'countDocuments', detail: 'Count matching documents', insertText: 'countDocuments({${1:}})' },
+  { label: 'distinct', detail: 'Distinct values for a field', insertText: "distinct('${1:field}', {${2:}})" },
+  { label: 'insertOne', detail: 'Insert one document', insertText: 'insertOne({${1:}})' },
+  { label: 'updateOne', detail: 'Update one document', insertText: 'updateOne({${1:filter}}, {\\$set: { ${2:field}: ${3:value} }})' },
+];
+
 const MONGODB_OPERATORS = [
   '$match', '$group', '$sort', '$limit', '$skip', '$project', '$unwind',
   '$lookup', '$addFields', '$set', '$unset', '$replaceRoot', '$merge', '$out',
@@ -252,6 +266,16 @@ const MONGODB_OPERATORS = [
   '$and', '$or', '$not', '$nor', '$exists', '$type', '$regex',
   '$push', '$addToSet', '$inc', '$min', '$max', '$mul', '$rename',
   '$sum', '$avg', '$first', '$last',
+];
+
+const MONGODB_GLOBALS = [
+  { label: 'db', detail: 'Current database handle' },
+  { label: 'ObjectId', detail: 'Create an ObjectId' },
+  { label: 'ISODate', detail: 'Create an ISO date value' },
+  { label: 'NumberLong', detail: 'Create a 64-bit integer' },
+  { label: 'true', detail: 'Boolean true' },
+  { label: 'false', detail: 'Boolean false' },
+  { label: 'null', detail: 'Null value' },
 ];
 
 // ============ Get definitions by DB type ============
@@ -386,6 +410,51 @@ function getTextBeforeCursor(model: Monaco.editor.ITextModel, position: Monaco.P
   return fullContext;
 }
 
+function extractMongoCollectionName(text: string): string | undefined {
+  const matches = [...text.matchAll(/db\.([A-Za-z_]\w*)/g)];
+  return matches.length > 0 ? matches[matches.length - 1][1] : undefined;
+}
+
+function isMongoCollectionRootContext(text: string): boolean {
+  return /db\.\s*$/.test(text);
+}
+
+function isMongoMethodContext(text: string): boolean {
+  return /db\.[A-Za-z_]\w*\.\s*$/.test(text);
+}
+
+function isMongoFieldContext(text: string): boolean {
+  return /(?:find|findOne|sort|project|distinct|countDocuments)\([^)]*$/.test(text) ||
+    /\$(?:match|group|sort|project|set|unset|addFields):\s*\{[^}]*$/.test(text);
+}
+
+function isMongoOperatorContext(text: string): boolean {
+  return /\$[\w]*$/.test(text) || /aggregate\(\s*\[[\s\S]*\{[\s\S]*$/.test(text);
+}
+
+function makeCompletionItem(
+  monacoInstance: typeof Monaco,
+  range: Monaco.IRange,
+  label: string,
+  detail: string,
+  insertText: string,
+  kind: Monaco.languages.CompletionItemKind,
+  sortText: string,
+  asSnippet = false,
+): Monaco.languages.CompletionItem {
+  return {
+    label,
+    kind,
+    detail,
+    insertText,
+    range,
+    sortText,
+    insertTextRules: asSnippet
+      ? monacoInstance.languages.CompletionItemInsertTextRule.InsertAsSnippet
+      : undefined,
+  };
+}
+
 // ============ Create Provider ============
 
 export function createSqlCompletionProvider(
@@ -394,243 +463,337 @@ export function createSqlCompletionProvider(
   getDatabase: () => string | undefined,
   getDbType: () => string | undefined,
 ): Monaco.IDisposable {
-  return monacoInstance.languages.registerCompletionItemProvider('sql', {
-    triggerCharacters: ['.', ' ', '\n', '$'],
+  const provideCompletionItems: Monaco.languages.CompletionItemProvider['provideCompletionItems'] = async (model, position) => {
+    const connectionId = getConnectionId();
+    const database = getDatabase();
+    const dbType = getDbType();
+    const textBeforeCursor = getTextBeforeCursor(model, position);
+    const word = model.getWordUntilPosition(position);
+    const range: Monaco.IRange = {
+      startLineNumber: position.lineNumber,
+      startColumn: word.startColumn,
+      endLineNumber: position.lineNumber,
+      endColumn: word.endColumn,
+    };
 
-    provideCompletionItems: async (model, position) => {
-      const connectionId = getConnectionId();
-      const database = getDatabase();
-      const dbType = getDbType();
-      const textBeforeCursor = getTextBeforeCursor(model, position);
-      const word = model.getWordUntilPosition(position);
-      const range: Monaco.IRange = {
-        startLineNumber: position.lineNumber,
-        startColumn: word.startColumn,
-        endLineNumber: position.lineNumber,
-        endColumn: word.endColumn,
-      };
+    const suggestions: Monaco.languages.CompletionItem[] = [];
 
-      const suggestions: Monaco.languages.CompletionItem[] = [];
+    // MongoDB special handling
+    if (dbType === 'mongodb') {
+      const activeCollection = extractMongoCollectionName(textBeforeCursor);
 
-      // MongoDB special handling
-      if (dbType === 'mongodb') {
-        // MongoDB operators
-        for (const op of MONGODB_OPERATORS) {
-          suggestions.push({
-            label: op,
-            kind: monacoInstance.languages.CompletionItemKind.Keyword,
-            detail: 'MongoDB Operator',
-            insertText: op,
+      for (const global of MONGODB_GLOBALS) {
+        suggestions.push(
+          makeCompletionItem(
+            monacoInstance,
             range,
-            sortText: '1' + op,
-          });
-        }
-        // MongoDB snippets
-        for (const snip of MONGODB_SNIPPETS) {
-          suggestions.push({
-            label: snip.label,
-            kind: monacoInstance.languages.CompletionItemKind.Snippet,
-            detail: snip.detail,
-            insertText: snip.insertText,
-            insertTextRules: monacoInstance.languages.CompletionItemInsertTextRule.InsertAsSnippet,
-            range,
-            sortText: '0' + snip.label,
-          });
-        }
-        // Collection names from schema cache
-        if (connectionId && database) {
-          const cache = await ensureSchemaLoaded(connectionId, database);
-          if (cache) {
-            for (const table of cache.tables) {
-              suggestions.push({
-                label: table.name,
-                kind: monacoInstance.languages.CompletionItemKind.Struct,
-                detail: 'Collection',
-                insertText: table.name,
-                range,
-                sortText: '0' + table.name,
-              });
-            }
-          }
-        }
-        return { suggestions };
+            global.label,
+            global.detail,
+            global.label,
+            monacoInstance.languages.CompletionItemKind.Keyword,
+            `0-${global.label}`,
+          )
+        );
       }
 
-      // SQL databases (MySQL, PostgreSQL, SQLite)
-
-      // 1. Check for "table." pattern → suggest columns
-      const dotMatch = textBeforeCursor.match(TABLE_DOT_PATTERN);
-      if (dotMatch && connectionId && database) {
-        const tableName = dotMatch[1];
-        const dotRange: Monaco.IRange = {
-          startLineNumber: position.lineNumber,
-          startColumn: position.column,
-          endLineNumber: position.lineNumber,
-          endColumn: position.column,
-        };
-        const cols = await ensureColumnsLoaded(connectionId, database, tableName);
-        for (const col of cols) {
-          suggestions.push({
-            label: col.name,
-            kind: monacoInstance.languages.CompletionItemKind.Field,
-            detail: `${col.columnType}${col.isPrimaryKey ? ' PK' : ''}${col.nullable ? '' : ' NOT NULL'}`,
-            documentation: col.comment || undefined,
-            insertText: col.name,
-            range: dotRange,
-            sortText: col.isPrimaryKey ? '0' + col.name : '1' + col.name,
-          });
-        }
-        if (suggestions.length > 0) {
-          suggestions.unshift({
-            label: '*',
-            kind: monacoInstance.languages.CompletionItemKind.Constant,
-            detail: 'All columns',
-            insertText: '*',
-            range: dotRange,
-            sortText: '00',
-          });
-          return { suggestions };
-        }
-      }
-
-      // 2. Table context
-      const isTableContext = TABLE_CONTEXT_KEYWORDS.test(textBeforeCursor);
-      if (isTableContext && connectionId && database) {
+      if (isMongoCollectionRootContext(textBeforeCursor) && connectionId && database) {
         const cache = await ensureSchemaLoaded(connectionId, database);
         if (cache) {
           for (const table of cache.tables) {
+            suggestions.push(
+              makeCompletionItem(
+                monacoInstance,
+                range,
+                table.name,
+                'Collection',
+                table.name,
+                monacoInstance.languages.CompletionItemKind.Struct,
+                `0-${table.name}`,
+              )
+            );
+          }
+        }
+      }
+
+      if (isMongoMethodContext(textBeforeCursor)) {
+        for (const method of MONGODB_COLLECTION_METHODS) {
+          suggestions.push(
+            makeCompletionItem(
+              monacoInstance,
+              range,
+              method.label,
+              method.detail,
+              method.insertText,
+              monacoInstance.languages.CompletionItemKind.Method,
+              `1-${method.label}`,
+              true,
+            )
+          );
+        }
+      }
+
+      if (activeCollection && connectionId && database && isMongoFieldContext(textBeforeCursor)) {
+        const fields = await ensureColumnsLoaded(connectionId, database, activeCollection);
+        for (const field of fields) {
+          suggestions.push(
+            makeCompletionItem(
+              monacoInstance,
+              range,
+              field.name,
+              `${field.columnType} (${activeCollection})`,
+              field.name,
+              monacoInstance.languages.CompletionItemKind.Field,
+              field.isPrimaryKey ? `0-${field.name}` : `2-${field.name}`,
+            )
+          );
+        }
+      }
+
+      if (isMongoOperatorContext(textBeforeCursor)) {
+        for (const op of MONGODB_OPERATORS) {
+          suggestions.push(
+            makeCompletionItem(
+              monacoInstance,
+              range,
+              op,
+              'MongoDB operator',
+              op,
+              monacoInstance.languages.CompletionItemKind.Keyword,
+              `1-${op}`,
+            )
+          );
+        }
+      }
+
+      if (connectionId && database) {
+        const cache = await ensureSchemaLoaded(connectionId, database);
+        if (cache) {
+          for (const table of cache.tables) {
+            if (!suggestions.find((item) => item.label === table.name)) {
+              suggestions.push(
+                makeCompletionItem(
+                  monacoInstance,
+                  range,
+                  table.name,
+                  'Collection',
+                  table.name,
+                  monacoInstance.languages.CompletionItemKind.Struct,
+                  `3-${table.name}`,
+                )
+              );
+            }
+          }
+        }
+      }
+
+      for (const snip of MONGODB_SNIPPETS) {
+        suggestions.push(
+          makeCompletionItem(
+            monacoInstance,
+            range,
+            snip.label,
+            snip.detail,
+            snip.insertText,
+            monacoInstance.languages.CompletionItemKind.Snippet,
+            `4-${snip.label}`,
+            true,
+          )
+        );
+      }
+
+      return { suggestions };
+    }
+
+    // SQL databases (MySQL, PostgreSQL, SQLite)
+    // 1. Check for "table." pattern → suggest columns
+    const dotMatch = textBeforeCursor.match(TABLE_DOT_PATTERN);
+    if (dotMatch && connectionId && database) {
+      const tableName = dotMatch[1];
+      const dotRange: Monaco.IRange = {
+        startLineNumber: position.lineNumber,
+        startColumn: position.column,
+        endLineNumber: position.lineNumber,
+        endColumn: position.column,
+      };
+      const cols = await ensureColumnsLoaded(connectionId, database, tableName);
+      for (const col of cols) {
+        suggestions.push({
+          label: col.name,
+          kind: monacoInstance.languages.CompletionItemKind.Field,
+          detail: `${col.columnType}${col.isPrimaryKey ? ' PK' : ''}${col.nullable ? '' : ' NOT NULL'}`,
+          documentation: col.comment || undefined,
+          insertText: col.name,
+          range: dotRange,
+          sortText: col.isPrimaryKey ? '0' + col.name : '1' + col.name,
+        });
+      }
+      if (suggestions.length > 0) {
+        suggestions.unshift({
+          label: '*',
+          kind: monacoInstance.languages.CompletionItemKind.Constant,
+          detail: 'All columns',
+          insertText: '*',
+          range: dotRange,
+          sortText: '00',
+        });
+        return { suggestions };
+      }
+    }
+
+    // 2. Table context
+    const isTableContext = TABLE_CONTEXT_KEYWORDS.test(textBeforeCursor);
+    if (isTableContext && connectionId && database) {
+      const cache = await ensureSchemaLoaded(connectionId, database);
+      if (cache) {
+        for (const table of cache.tables) {
+          suggestions.push({
+            label: table.name,
+            kind: table.tableType === 'View'
+              ? monacoInstance.languages.CompletionItemKind.Interface
+              : monacoInstance.languages.CompletionItemKind.Struct,
+            detail: table.tableType === 'View' ? 'View' : 'Table',
+            insertText: table.name,
+            range,
+            sortText: '0' + table.name,
+          });
+        }
+      }
+    }
+
+    // 3. Column context
+    const isColumnContext = COLUMN_CONTEXT_KEYWORDS.test(textBeforeCursor);
+    if (isColumnContext && connectionId && database) {
+      const fullText = model.getValue();
+      const referencedTables = extractReferencedTables(fullText);
+      const cache = await ensureSchemaLoaded(connectionId, database);
+
+      if (cache) {
+        for (const table of cache.tables) {
+          if (referencedTables.has(table.name.toLowerCase())) {
             suggestions.push({
               label: table.name,
-              kind: table.tableType === 'View'
-                ? monacoInstance.languages.CompletionItemKind.Interface
-                : monacoInstance.languages.CompletionItemKind.Struct,
-              detail: table.tableType === 'View' ? 'View' : 'Table',
+              kind: monacoInstance.languages.CompletionItemKind.Struct,
+              detail: 'Table',
               insertText: table.name,
               range,
-              sortText: '0' + table.name,
+              sortText: '1' + table.name,
+            });
+          }
+        }
+
+        for (const tName of referencedTables) {
+          const actualTable = cache.tables.find(t => t.name.toLowerCase() === tName);
+          if (!actualTable) continue;
+          const cols = await ensureColumnsLoaded(connectionId, database, actualTable.name);
+          for (const col of cols) {
+            const prefix = referencedTables.size > 1 ? `${actualTable.name}.` : '';
+            suggestions.push({
+              label: referencedTables.size > 1 ? `${actualTable.name}.${col.name}` : col.name,
+              kind: monacoInstance.languages.CompletionItemKind.Field,
+              detail: `${col.columnType}${col.isPrimaryKey ? ' PK' : ''} (${actualTable.name})`,
+              documentation: col.comment || undefined,
+              insertText: `${prefix}${col.name}`,
+              range,
+              sortText: '0' + col.name,
             });
           }
         }
       }
+    }
 
-      // 3. Column context
-      const isColumnContext = COLUMN_CONTEXT_KEYWORDS.test(textBeforeCursor);
-      if (isColumnContext && connectionId && database) {
-        const fullText = model.getValue();
-        const referencedTables = extractReferencedTables(fullText);
-        const cache = await ensureSchemaLoaded(connectionId, database);
+    // 4. Keywords (db-type specific)
+    const hasSchemaSuggestions = suggestions.length > 0;
+    const keywords = getKeywords(dbType);
+    for (const kw of keywords) {
+      suggestions.push({
+        label: kw,
+        kind: monacoInstance.languages.CompletionItemKind.Keyword,
+        detail: `Keyword (${dbType || 'SQL'})`,
+        insertText: kw,
+        range,
+        sortText: hasSchemaSuggestions ? '3' + kw : '1' + kw,
+      });
+    }
 
-        if (cache) {
-          for (const table of cache.tables) {
-            if (referencedTables.has(table.name.toLowerCase())) {
-              suggestions.push({
-                label: table.name,
-                kind: monacoInstance.languages.CompletionItemKind.Struct,
-                detail: 'Table',
-                insertText: table.name,
-                range,
-                sortText: '1' + table.name,
-              });
-            }
-          }
+    // 5. Data types (db-type specific)
+    const types = getTypes(dbType);
+    for (const t of types) {
+      suggestions.push({
+        label: t,
+        kind: monacoInstance.languages.CompletionItemKind.TypeParameter,
+        detail: `Type (${dbType || 'SQL'})`,
+        insertText: t,
+        range,
+        sortText: '4' + t,
+      });
+    }
 
-          for (const tName of referencedTables) {
-            const actualTable = cache.tables.find(t => t.name.toLowerCase() === tName);
-            if (!actualTable) continue;
-            const cols = await ensureColumnsLoaded(connectionId, database, actualTable.name);
-            for (const col of cols) {
-              const prefix = referencedTables.size > 1 ? `${actualTable.name}.` : '';
-              suggestions.push({
-                label: referencedTables.size > 1 ? `${actualTable.name}.${col.name}` : col.name,
-                kind: monacoInstance.languages.CompletionItemKind.Field,
-                detail: `${col.columnType}${col.isPrimaryKey ? ' PK' : ''} (${actualTable.name})`,
-                documentation: col.comment || undefined,
-                insertText: `${prefix}${col.name}`,
-                range,
-                sortText: '0' + col.name,
-              });
-            }
-          }
-        }
-      }
+    // 6. Functions (db-type specific)
+    const functions = getFunctions(dbType);
+    for (const fn of functions) {
+      suggestions.push({
+        label: fn.name,
+        kind: monacoInstance.languages.CompletionItemKind.Function,
+        detail: fn.detail,
+        insertText: fn.insertText,
+        insertTextRules: monacoInstance.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+        range,
+        sortText: hasSchemaSuggestions ? '2' + fn.name : '0' + fn.name,
+      });
+    }
 
-      // 4. Keywords (db-type specific)
-      const hasSchemaSuggestions = suggestions.length > 0;
-      const keywords = getKeywords(dbType);
-      for (const kw of keywords) {
-        suggestions.push({
-          label: kw,
-          kind: monacoInstance.languages.CompletionItemKind.Keyword,
-          detail: `Keyword (${dbType || 'SQL'})`,
-          insertText: kw,
-          range,
-          sortText: hasSchemaSuggestions ? '3' + kw : '1' + kw,
-        });
-      }
+    // 7. Snippets (db-type specific)
+    const snippets = getSnippets(dbType);
+    for (const snip of snippets) {
+      suggestions.push({
+        label: snip.label,
+        kind: monacoInstance.languages.CompletionItemKind.Snippet,
+        detail: snip.detail,
+        insertText: snip.insertText,
+        insertTextRules: monacoInstance.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+        range,
+        sortText: '5' + snip.label,
+      });
+    }
 
-      // 5. Data types (db-type specific)
-      const types = getTypes(dbType);
-      for (const t of types) {
-        suggestions.push({
-          label: t,
-          kind: monacoInstance.languages.CompletionItemKind.TypeParameter,
-          detail: `Type (${dbType || 'SQL'})`,
-          insertText: t,
-          range,
-          sortText: '4' + t,
-        });
-      }
-
-      // 6. Functions (db-type specific)
-      const functions = getFunctions(dbType);
-      for (const fn of functions) {
-        suggestions.push({
-          label: fn.name,
-          kind: monacoInstance.languages.CompletionItemKind.Function,
-          detail: fn.detail,
-          insertText: fn.insertText,
-          insertTextRules: monacoInstance.languages.CompletionItemInsertTextRule.InsertAsSnippet,
-          range,
-          sortText: hasSchemaSuggestions ? '2' + fn.name : '0' + fn.name,
-        });
-      }
-
-      // 7. Snippets (db-type specific)
-      const snippets = getSnippets(dbType);
-      for (const snip of snippets) {
-        suggestions.push({
-          label: snip.label,
-          kind: monacoInstance.languages.CompletionItemKind.Snippet,
-          detail: snip.detail,
-          insertText: snip.insertText,
-          insertTextRules: monacoInstance.languages.CompletionItemInsertTextRule.InsertAsSnippet,
-          range,
-          sortText: '5' + snip.label,
-        });
-      }
-
-      // 8. Table names always (lower priority)
-      if (!isTableContext && connectionId && database) {
-        const cache = await ensureSchemaLoaded(connectionId, database);
-        if (cache) {
-          for (const table of cache.tables) {
-            if (!suggestions.find(s => s.label === table.name && s.kind === monacoInstance.languages.CompletionItemKind.Struct)) {
-              suggestions.push({
-                label: table.name,
-                kind: monacoInstance.languages.CompletionItemKind.Struct,
-                detail: table.tableType === 'View' ? 'View' : 'Table',
-                insertText: table.name,
-                range,
-                sortText: '2' + table.name,
-              });
-            }
+    // 8. Table names always (lower priority)
+    if (!isTableContext && connectionId && database) {
+      const cache = await ensureSchemaLoaded(connectionId, database);
+      if (cache) {
+        for (const table of cache.tables) {
+          if (!suggestions.find(s => s.label === table.name && s.kind === monacoInstance.languages.CompletionItemKind.Struct)) {
+            suggestions.push({
+              label: table.name,
+              kind: monacoInstance.languages.CompletionItemKind.Struct,
+              detail: table.tableType === 'View' ? 'View' : 'Table',
+              insertText: table.name,
+              range,
+              sortText: '2' + table.name,
+            });
           }
         }
       }
+    }
 
-      return { suggestions };
-    },
+    return { suggestions };
+  };
+
+  const sqlProvider = monacoInstance.languages.registerCompletionItemProvider('sql', {
+    triggerCharacters: ['.', ' ', '\n', '$'],
+    provideCompletionItems,
   });
+
+  const mongoProvider = monacoInstance.languages.registerCompletionItemProvider('mongodb', {
+    triggerCharacters: ['.', ' ', '\n', '$', ':'],
+    provideCompletionItems,
+  });
+
+  return {
+    dispose() {
+      sqlProvider.dispose();
+      mongoProvider.dispose();
+    },
+  };
 }
 
 /** Extract table names referenced in FROM / JOIN clauses */

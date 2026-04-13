@@ -46,6 +46,60 @@ export function SqlEditor({
   useEffect(() => {
     if (!monaco) return;
 
+    monaco.languages.register({ id: 'mongodb' });
+    monaco.languages.setLanguageConfiguration('mongodb', {
+      comments: {
+        lineComment: '//',
+        blockComment: ['/*', '*/'],
+      },
+      brackets: [
+        ['{', '}'],
+        ['[', ']'],
+        ['(', ')'],
+      ],
+      autoClosingPairs: [
+        { open: '{', close: '}' },
+        { open: '[', close: ']' },
+        { open: '(', close: ')' },
+        { open: '"', close: '"' },
+        { open: "'", close: "'" },
+      ],
+      surroundingPairs: [
+        { open: '{', close: '}' },
+        { open: '[', close: ']' },
+        { open: '(', close: ')' },
+        { open: '"', close: '"' },
+        { open: "'", close: "'" },
+      ],
+    });
+    monaco.languages.setMonarchTokensProvider('mongodb', {
+      tokenizer: {
+        root: [
+          [/\bdb\b/, 'keyword'],
+          [/\b(?:find|findOne|aggregate|insertOne|insertMany|updateOne|updateMany|deleteOne|deleteMany|countDocuments|distinct|createIndex|sort|limit|skip|project)\b/, 'type'],
+          [/\$[a-zA-Z_]\w*/, 'keyword'],
+          [/[{}()[\]]/, '@brackets'],
+          [/[,:.]/, 'delimiter'],
+          [/-?\d+(?:\.\d+)?/, 'number'],
+          [/"([^"\\]|\\.)*$/, 'string.invalid'],
+          [/'([^'\\]|\\.)*$/, 'string.invalid'],
+          [/"/, { token: 'string.quote', bracket: '@open', next: '@doubleString' }],
+          [/'/, { token: 'string.quote', bracket: '@open', next: '@singleString' }],
+          [/[a-zA-Z_][\w-]*/, 'identifier'],
+        ],
+        doubleString: [
+          [/[^\\"]+/, 'string'],
+          [/\\./, 'string.escape'],
+          [/"/, { token: 'string.quote', bracket: '@close', next: '@pop' }],
+        ],
+        singleString: [
+          [/[^\\']+/, 'string'],
+          [/\\./, 'string.escape'],
+          [/'/, { token: 'string.quote', bracket: '@close', next: '@pop' }],
+        ],
+      },
+    });
+
     monaco.editor.defineTheme('ferrobase-dark', {
       base: 'vs-dark',
       inherit: true,
@@ -93,7 +147,7 @@ export function SqlEditor({
     });
   }, [monaco]);
 
-  // Register SQL completion provider (once per Monaco instance)
+  // Register query completion provider (once per Monaco instance)
   useEffect(() => {
     if (!monaco) return;
 
@@ -120,7 +174,21 @@ export function SqlEditor({
       const ed = editor as {
         addAction: (action: unknown) => void;
         addCommand: (keybinding: number, handler: () => void) => void;
+        onDidChangeModelContent?: (listener: (event: { changes: Array<{ text: string }> }) => void) => { dispose: () => void };
+        getAction?: (id: string) => { run: () => void };
       };
+
+      if (language === 'mongodb' && ed.onDidChangeModelContent && ed.getAction) {
+        ed.onDidChangeModelContent((event) => {
+          const lastChange = event.changes[event.changes.length - 1];
+          const inserted = lastChange?.text ?? '';
+          if (/^[\w$]$/.test(inserted)) {
+            queueMicrotask(() => {
+              ed.getAction?.('editor.action.triggerSuggest')?.run();
+            });
+          }
+        });
+      }
 
       // Add execute command (Cmd+Enter)
       ed.addAction({
@@ -145,13 +213,16 @@ export function SqlEditor({
       // Format SQL (Shift+Alt+F)
       ed.addAction({
         id: 'format-sql',
-        label: 'Format SQL',
+        label: language === 'mongodb' ? 'Format Mongo Query' : 'Format SQL',
         keybindings: [
           (monaco?.KeyMod.Shift ?? 1024) |
           (monaco?.KeyMod.Alt ?? 512) |
           (monaco?.KeyCode.KeyF ?? 33),
         ],
         run: (ed: unknown) => {
+          if (language === 'mongodb') {
+            return;
+          }
           const editor = ed as { getValue: () => string; setValue: (v: string) => void };
           try {
             const formatted = format(editor.getValue(), {
@@ -178,7 +249,7 @@ export function SqlEditor({
         },
       });
     },
-    [monaco, onExecute, onSave]
+    [language, monaco, onExecute, onSave]
   );
 
   return (

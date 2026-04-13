@@ -100,6 +100,7 @@ export function QueryEditorTab({ tab }: Props) {
   );
 
   const selectedConnection = connections.find((c) => c.id === tab.connectionId);
+  const editorLanguage = selectedConnection?.dbType === 'mongodb' ? 'mongodb' : 'sql';
 
   const startTimer = () => {
     setElapsed(0);
@@ -355,6 +356,7 @@ export function QueryEditorTab({ tab }: Props) {
             connectionId={tab.connectionId}
             database={tab.database}
             dbType={selectedConnection?.dbType}
+            language={editorLanguage}
           />
         </Panel>
         <PanelResizeHandle className="h-px bg-[var(--border)] hover:bg-[var(--accent)] transition-colors cursor-row-resize" />

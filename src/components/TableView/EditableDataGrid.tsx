@@ -10,6 +10,11 @@ import { useSettingsStore } from '../../stores';
 import { ContextMenu, type MenuItemOrSeparator } from '../ContextMenu';
 import { JsonEditorDialog } from './JsonEditorDialog';
 import { useConfirmDialog } from '../ConfirmDialog';
+import {
+  formatMongoValue,
+  parseMongoInputValue,
+  shouldUseMongoJsonEditor,
+} from './mongoValue';
 
 interface Props {
   results: QueryResult;
@@ -157,6 +162,7 @@ export function EditableDataGrid({
   // Start editing — open JSON editor for object/json values, inline input for primitives
   const startEdit = (rowRef: 'new' | number, newIdx: number | undefined, colIdx: number) => {
     if (rowRef !== 'new' && !hasPk) return;
+    if (dbType === 'mongodb' && rowRef !== 'new' && results.columns[colIdx].name === '_id') return;
     let currentVal: unknown;
     if (rowRef === 'new' && newIdx !== undefined) {
       currentVal = getNewCellVal(newIdx, colIdx);
@@ -165,11 +171,12 @@ export function EditableDataGrid({
     }
 
     const colDataType = results.columns[colIdx].dataType?.toLowerCase() ?? '';
-    const isJsonType = colDataType === 'json' || colDataType === 'jsonb';
-    const isObjectVal = currentVal !== null && currentVal !== undefined && typeof currentVal === 'object';
+    const opensJsonEditor = dbType === 'mongodb'
+      ? shouldUseMongoJsonEditor(currentVal, colDataType)
+      : colDataType === 'json' || colDataType === 'jsonb' || (currentVal !== null && currentVal !== undefined && typeof currentVal === 'object');
 
     // Open JSON editor dialog for object values or JSON-typed columns
-    if (isObjectVal || isJsonType) {
+    if (opensJsonEditor) {
       setJsonEditor({
         rowRef,
         newIdx,
@@ -182,7 +189,13 @@ export function EditableDataGrid({
     }
 
     setEditingCell({ rowRef, newIdx, col: colIdx });
-    setEditValue(currentVal === null || currentVal === undefined ? '' : String(currentVal));
+    setEditValue(
+      currentVal === null || currentVal === undefined
+        ? ''
+        : dbType === 'mongodb'
+          ? formatMongoValue(currentVal)
+          : String(currentVal)
+    );
     setTimeout(() => inputRef.current?.select(), 0);
   };
 
@@ -217,8 +230,12 @@ export function EditableDataGrid({
     if (!editingCell) return;
     const { rowRef, newIdx, col: colIdx } = editingCell;
     const colName = results.columns[colIdx].name;
-
-    let newVal: unknown = editValue.trim().toUpperCase() === 'NULL' ? null : editValue;
+    const colDataType = results.columns[colIdx].dataType?.toLowerCase() ?? '';
+    let newVal: unknown = editValue.trim().toUpperCase() === 'NULL'
+      ? null
+      : dbType === 'mongodb'
+        ? parseMongoInputValue(editValue, colDataType)
+        : editValue;
 
     if (rowRef === 'new' && newIdx !== undefined) {
       setNewRows((prev) => {
@@ -241,7 +258,7 @@ export function EditableDataGrid({
       });
     }
     setEditingCell(null);
-  }, [editingCell, editValue, results]);
+  }, [dbType, editingCell, editValue, results]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); commitEdit(); }
@@ -532,6 +549,9 @@ export function EditableDataGrid({
       return <span className={val ? 'text-green-400' : 'text-red-400'}>{labels[settings.boolDisplay]}</span>;
     }
     if (typeof val === 'object') {
+      if (dbType === 'mongodb') {
+        return <span className="text-purple-400 text-[10px] cursor-pointer">{formatMongoValue(val)}</span>;
+      }
       const jsonStr = JSON.stringify(val);
       return <span className="text-purple-400 text-[10px] cursor-pointer" title={jsonStr}>{jsonStr.length > 60 ? jsonStr.slice(0, 60) + '…' : jsonStr}</span>;
     }
@@ -674,10 +694,10 @@ export function EditableDataGrid({
                         className={cn(
                           'px-3 py-1 border-r border-[var(--border)] max-w-[280px] truncate',
                           cellDirty && 'bg-yellow-500/10',
-                          hasPk && !isEditing && 'cursor-text',
+                          hasPk && !isEditing && !(dbType === 'mongodb' && col.name === '_id') && 'cursor-text',
                         )}
                         onDoubleClick={() => startEdit(originalIdx, undefined, colIdx)}
-                        title={val !== null && typeof val !== 'object' ? String(val) : undefined}
+                        title={val !== null && val !== undefined ? (dbType === 'mongodb' ? formatMongoValue(val) : typeof val !== 'object' ? String(val) : undefined) : undefined}
                       >
                         {isEditing ? (
                           <input
@@ -737,7 +757,7 @@ export function EditableDataGrid({
                         />
                       ) : (
                         <span className="text-green-400/80 italic text-[10px]">
-                          {val === null || val === undefined ? 'click to edit' : String(val)}
+                          {val === null || val === undefined ? 'click to edit' : dbType === 'mongodb' ? formatMongoValue(val) : String(val)}
                         </span>
                       )}
                     </td>

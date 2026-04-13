@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import {
   Columns, List, Code, Table2, RefreshCw, Loader2,
   ChevronLeft, ChevronRight, AlertCircle, PlusCircle, Filter, X,
@@ -20,6 +20,27 @@ interface Props {
 }
 
 const PAGE_SIZES = [50, 100, 200, 500];
+const MONGO_FILTER_SNIPPETS = [
+  '{ _id: ObjectId("...") }',
+  "{ trackNumber: 'QA1106CP004' }",
+  "{ createdAt: { $gte: ISODate('2024-01-01T00:00:00.000Z') } }",
+  "{ status: { $in: ['open', 'closed'] } }",
+  "{ $or: [{ type: 'delivery' }, { type: 'pickup' }] }",
+];
+const MONGO_FILTER_OPERATORS = [
+  '$eq',
+  '$ne',
+  '$gt',
+  '$gte',
+  '$lt',
+  '$lte',
+  '$in',
+  '$nin',
+  '$exists',
+  '$regex',
+  '$and',
+  '$or',
+];
 
 type SortDir = 'asc' | 'desc';
 interface SortState {
@@ -45,6 +66,7 @@ export function TableViewTab({ tab }: Props) {
   const [pageSize, setPageSize] = useState(100);
   const [whereInput, setWhereInput] = useState('');
   const [whereClause, setWhereClause] = useState('');
+  const [showMongoFilterSuggestions, setShowMongoFilterSuggestions] = useState(false);
   const [dataViewMode, setDataViewMode] = useState<'grid' | 'record'>('grid');
   const [selectedRowIndex, setSelectedRowIndex] = useState(0);
 
@@ -60,6 +82,7 @@ export function TableViewTab({ tab }: Props) {
     setPage(1);
     setWhereInput('');
     setWhereClause('');
+    setShowMongoFilterSuggestions(false);
   }, [tab.tableName, tab.database]);
 
   useEffect(() => {
@@ -82,6 +105,46 @@ export function TableViewTab({ tab }: Props) {
       loadData('data');
     }
   }, [page, pageSize, whereClause]);
+
+  const loadPreviewData = async (
+    nextPage = page,
+    nextPageSize = pageSize,
+    nextWhereClause = whereClause,
+    isRefresh = false,
+  ) => {
+    if (!isRefresh) setLoading(true);
+    if (isRefresh) setRefreshing(true);
+    setError(null);
+    try {
+      const offset = (nextPage - 1) * nextPageSize;
+      const data = await schemaApi.getTableDataPreview(
+        tab.connectionId,
+        tab.database,
+        tab.tableName,
+        tab.schema,
+        nextPageSize,
+        offset,
+        nextWhereClause || undefined,
+      );
+      setPreviewData(data);
+    } catch (e) {
+      setError(extractErrorMessage(e));
+    } finally {
+      if (!isRefresh) setLoading(false);
+      if (isRefresh) setRefreshing(false);
+    }
+  };
+
+  const applyWhereFilter = async () => {
+    const nextClause = whereInput.trim();
+    const nextPage = 1;
+    setWhereClause(nextClause);
+    setPage(nextPage);
+    setShowMongoFilterSuggestions(false);
+    if (activeTab === 'data') {
+      await loadPreviewData(nextPage, pageSize, nextClause, true);
+    }
+  };
 
   const loadData = async (t: typeof activeTab, isRefresh = false) => {
     // Only show full loading spinner on initial load, not on refresh
@@ -122,17 +185,7 @@ export function TableViewTab({ tab }: Props) {
           break;
         }
         case 'data': {
-          const offset = (page - 1) * pageSize;
-          const data = await schemaApi.getTableDataPreview(
-            tab.connectionId,
-            tab.database,
-            tab.tableName,
-            tab.schema,
-            pageSize,
-            offset,
-            whereClause || undefined,
-          );
-          setPreviewData(data);
+          await loadPreviewData(page, pageSize, whereClause, isRefresh);
           break;
         }
       }
@@ -152,6 +205,31 @@ export function TableViewTab({ tab }: Props) {
   ];
 
   const hasNextPage = previewData !== null && previewData.rowCount >= pageSize;
+  const isMongo = dbType === 'mongodb';
+  const mongoFilterSuggestions = useMemo(() => {
+    if (!isMongo) return [];
+
+    const suggestions = [
+      ...columns.map((col) => col.name),
+      ...columns.map((col) => `{ ${col.name}: '' }`),
+      ...columns
+        .filter((col) => col.dataType === 'objectId')
+        .map((col) => `{ ${col.name}: ObjectId("") }`),
+      ...columns
+        .filter((col) => col.dataType === 'date')
+        .map((col) => `{ ${col.name}: { $gte: ISODate("") } }`),
+      ...MONGO_FILTER_OPERATORS,
+      ...MONGO_FILTER_SNIPPETS,
+    ];
+
+    const tokenMatch = whereInput.match(/[\w$]+$/);
+    const token = tokenMatch?.[0]?.toLowerCase() ?? '';
+    const filtered = token
+      ? suggestions.filter((item) => item.toLowerCase().includes(token))
+      : suggestions;
+
+    return [...new Set(filtered)].slice(0, 8);
+  }, [columns, isMongo, whereInput]);
 
   return (
     <div className="flex flex-col h-full">
@@ -241,21 +319,53 @@ export function TableViewTab({ tab }: Props) {
                   <div className="w-px h-4 bg-[var(--border)]" />
                   <Filter size={12} className="text-[var(--text-muted)] flex-shrink-0" />
                   <span className="text-xs text-[var(--text-muted)] flex-shrink-0">WHERE</span>
-                  <input
-                    type="text"
-                    value={whereInput}
-                    onChange={(e) => setWhereInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        setWhereClause(whereInput);
-                        setPage(1);
-                      }
-                    }}
-                    placeholder="e.g. id > 100 AND status = 'active'"
-                    autoComplete="off"
-                    autoCapitalize="off"
-                    className="flex-1 text-xs bg-[var(--bg-primary)] border border-[var(--border)] rounded px-2 py-1 outline-none focus:border-[var(--accent)] text-[var(--text-primary)] placeholder-[var(--text-muted)] font-mono"
-                  />
+                  <div className="relative flex-1">
+                    <input
+                      type="text"
+                      value={whereInput}
+                      onChange={(e) => {
+                        setWhereInput(e.target.value);
+                        if (isMongo) setShowMongoFilterSuggestions(true);
+                      }}
+                      onFocus={() => {
+                        if (isMongo) setShowMongoFilterSuggestions(true);
+                      }}
+                      onBlur={() => {
+                        if (isMongo) {
+                          setTimeout(() => setShowMongoFilterSuggestions(false), 120);
+                        }
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          void applyWhereFilter();
+                        } else if (e.key === 'Escape' && isMongo) {
+                          setShowMongoFilterSuggestions(false);
+                        }
+                      }}
+                      placeholder={isMongo ? "{ trackNumber: 'QA1106CP004' }" : "e.g. id > 100 AND status = 'active'"}
+                      autoComplete="off"
+                      autoCapitalize="off"
+                      className="w-full text-xs bg-[var(--bg-primary)] border border-[var(--border)] rounded px-2 py-1 outline-none focus:border-[var(--accent)] text-[var(--text-primary)] placeholder-[var(--text-muted)] font-mono"
+                    />
+                    {isMongo && showMongoFilterSuggestions && mongoFilterSuggestions.length > 0 && (
+                      <div className="absolute z-20 top-full mt-1 left-0 right-0 max-h-56 overflow-auto rounded border border-[var(--border)] bg-[var(--bg-primary)] shadow-lg">
+                        {mongoFilterSuggestions.map((suggestion) => (
+                          <button
+                            key={suggestion}
+                            type="button"
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => {
+                              setWhereInput(suggestion);
+                              setShowMongoFilterSuggestions(false);
+                            }}
+                            className="w-full px-2 py-1.5 text-left text-xs font-mono hover:bg-[var(--bg-hover)] text-[var(--text-primary)]"
+                          >
+                            {suggestion}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                   {whereClause && (
                     <button
                       onClick={() => { setWhereInput(''); setWhereClause(''); setPage(1); }}
@@ -266,7 +376,7 @@ export function TableViewTab({ tab }: Props) {
                     </button>
                   )}
                   <button
-                    onClick={() => { setWhereClause(whereInput); setPage(1); }}
+                    onClick={applyWhereFilter}
                     className="px-2 py-1 text-xs bg-[var(--accent)] text-white rounded hover:opacity-90"
                   >
                     Apply

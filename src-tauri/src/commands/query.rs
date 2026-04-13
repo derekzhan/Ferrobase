@@ -1,4 +1,5 @@
 use chrono::Utc;
+use mongodb::bson::Document;
 use once_cell::sync::Lazy;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -28,38 +29,29 @@ async fn add_to_history(entry: QueryHistoryEntry) {
 
 struct MongoFind {
     collection: String,
-    filter: Option<serde_json::Value>,
+    filter: Option<Document>,
+    projection: Option<Document>,
+    sort: Option<Document>,
     limit: i64,
     skip: i64,
 }
 
-fn find_close_paren(s: &str) -> Option<usize> {
-    let mut depth = 1i32;
-    for (i, c) in s.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+struct MongoAggregate {
+    collection: String,
+    pipeline: Vec<Document>,
+    limit: Option<i64>,
+    skip: Option<i64>,
 }
 
-fn extract_chain_int(chain: &str, method: &str) -> Option<i64> {
-    let pattern = format!(".{}(", method);
-    let pos = chain.find(&pattern)?;
-    let after = &chain[pos + pattern.len()..];
-    let end = after.find(')')?;
-    after[..end].trim().parse().ok()
+enum MongoStatement {
+    Find(MongoFind),
+    Aggregate(MongoAggregate),
 }
 
-/// Try to parse `db.collection.find({filter}).limit(n).skip(m)` style syntax.
-fn parse_mongo_find(stmt: &str) -> Option<MongoFind> {
+/// Try to parse shell-style MongoDB syntax like:
+/// - `db.collection.find({ filter }).sort({ createdAt: -1 }).limit(100)`
+/// - `db.collection.aggregate([{ $match: { status: 'open' } }]).limit(50)`
+fn parse_mongo_statement(stmt: &str) -> Option<MongoStatement> {
     let s = stmt.trim();
 
     if !s.starts_with("db.") {
@@ -73,34 +65,55 @@ fn parse_mongo_find(stmt: &str) -> Option<MongoFind> {
     let collection = after_db[..dot].to_string();
     let after_collection = &after_db[dot + 1..];
 
-    // Only handle "find(" for now
-    if !after_collection.starts_with("find(") {
-        return None;
+    if let Some(after_find) = after_collection.strip_prefix("findOne(") {
+        let filter_end = db::mongodb_driver::find_shell_close_paren(after_find)?;
+        let filter_str = after_find[..filter_end].trim();
+        let chain = after_find[filter_end + 1..].to_string();
+
+        return Some(MongoStatement::Find(MongoFind {
+            collection,
+            filter: db::mongodb_driver::parse_shell_document(filter_str),
+            projection: db::mongodb_driver::extract_shell_chain_arg(&chain, "project")
+                .and_then(|arg| db::mongodb_driver::parse_shell_document(&arg)),
+            sort: db::mongodb_driver::extract_shell_chain_arg(&chain, "sort")
+                .and_then(|arg| db::mongodb_driver::parse_shell_document(&arg)),
+            limit: 1,
+            skip: db::mongodb_driver::extract_shell_chain_int(&chain, "skip").unwrap_or(0),
+        }));
     }
 
-    let after_find = &after_collection[5..]; // strip "find("
+    if let Some(after_find) = after_collection.strip_prefix("find(") {
+        let filter_end = db::mongodb_driver::find_shell_close_paren(after_find)?;
+        let filter_str = after_find[..filter_end].trim();
+        let chain = after_find[filter_end + 1..].to_string();
 
-    // Find matching closing paren
-    let filter_end = find_close_paren(after_find)?;
-    let filter_str = after_find[..filter_end].trim();
+        return Some(MongoStatement::Find(MongoFind {
+            collection,
+            filter: db::mongodb_driver::parse_shell_document(filter_str),
+            projection: db::mongodb_driver::extract_shell_chain_arg(&chain, "project")
+                .and_then(|arg| db::mongodb_driver::parse_shell_document(&arg)),
+            sort: db::mongodb_driver::extract_shell_chain_arg(&chain, "sort")
+                .and_then(|arg| db::mongodb_driver::parse_shell_document(&arg)),
+            limit: db::mongodb_driver::extract_shell_chain_int(&chain, "limit").unwrap_or(100),
+            skip: db::mongodb_driver::extract_shell_chain_int(&chain, "skip").unwrap_or(0),
+        }));
+    }
 
-    let filter: Option<serde_json::Value> = if filter_str.is_empty() || filter_str == "{}" {
-        None
-    } else {
-        serde_json::from_str(filter_str).ok()
-    };
+    if let Some(after_aggregate) = after_collection.strip_prefix("aggregate(") {
+        let pipeline_end = db::mongodb_driver::find_shell_close_paren(after_aggregate)?;
+        let pipeline_str = after_aggregate[..pipeline_end].trim();
+        let chain = after_aggregate[pipeline_end + 1..].to_string();
+        let pipeline = db::mongodb_driver::parse_shell_pipeline(pipeline_str)?;
 
-    // Parse chained .limit(n) and .skip(m)
-    let chain = after_find[filter_end + 1..].to_string();
-    let limit = extract_chain_int(&chain, "limit").unwrap_or(100);
-    let skip = extract_chain_int(&chain, "skip").unwrap_or(0);
+        return Some(MongoStatement::Aggregate(MongoAggregate {
+            collection,
+            pipeline,
+            limit: db::mongodb_driver::extract_shell_chain_int(&chain, "limit"),
+            skip: db::mongodb_driver::extract_shell_chain_int(&chain, "skip"),
+        }));
+    }
 
-    Some(MongoFind {
-        collection,
-        filter,
-        limit,
-        skip,
-    })
+    None
 }
 
 fn docs_to_query_result(docs: &[serde_json::Value], query_str: &str) -> QueryResult {
@@ -118,11 +131,45 @@ fn docs_to_query_result(docs: &[serde_json::Value], query_str: &str) -> QueryRes
 
     let columns: Vec<ColumnInfo> = all_keys
         .iter()
-        .map(|k| ColumnInfo {
-            name: k.clone(),
-            data_type: "json".to_string(),
-            nullable: true,
-            is_primary_key: k == "_id",
+        .map(|k| {
+            let inferred_type = docs
+                .iter()
+                .filter_map(|doc| match doc {
+                    serde_json::Value::Object(map) => map.get(k),
+                    _ => None,
+                })
+                .map(db::mongodb_driver::mongo_value_type_name)
+                .fold(None::<String>, |current, next| {
+                    let merged = match current {
+                        None => next.to_string(),
+                        Some(existing) if existing == next || next == "null" => existing,
+                        Some(existing) if existing == "null" => next.to_string(),
+                        Some(existing) if existing == "int" && next == "long" => "long".to_string(),
+                        Some(existing) if existing == "long" && next == "int" => "long".to_string(),
+                        Some(existing)
+                            if (existing == "int" || existing == "long" || existing == "double")
+                                && (next == "int" || next == "long" || next == "double") =>
+                        {
+                            if existing == "double" || next == "double" {
+                                "double".to_string()
+                            } else if existing == "long" || next == "long" {
+                                "long".to_string()
+                            } else {
+                                "int".to_string()
+                            }
+                        }
+                        Some(_) => "json".to_string(),
+                    };
+                    Some(merged)
+                })
+                .unwrap_or_else(|| "null".to_string());
+
+            ColumnInfo {
+                name: k.clone(),
+                data_type: inferred_type,
+                nullable: true,
+                is_primary_key: k == "_id",
+            }
         })
         .collect();
 
@@ -213,37 +260,58 @@ async fn execute_query_impl(
                 db::sqlite::execute_query_owned(pool, stmt.clone()).await
             }
             DatabaseConnection::Mongodb(client) => {
-                // Parse MongoDB shell syntax (e.g. db.collection.find({}).limit(100))
-                if let Some(op) = parse_mongo_find(&stmt) {
-                    let db_name = database.as_deref().unwrap_or("");
-                    let filter = op.filter.and_then(|v| {
-                        if let serde_json::Value::Object(map) = v {
-                            let mut doc = mongodb::bson::Document::new();
-                            for (k, val) in map {
-                                if let Ok(bval) = mongodb::bson::to_bson(&val) {
-                                    doc.insert(k, bval);
-                                }
-                            }
-                            Some(doc)
-                        } else {
-                            None
+                // Parse MongoDB shell syntax (e.g. db.collection.find({...}), db.collection.aggregate([...]))
+                if let Some(op) = parse_mongo_statement(&stmt) {
+                    let db_name = database
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .ok_or_else(|| {
+                            AppError::Query(
+                                "MongoDB query requires a database name. Set the query tab's database field to the exact database shown in the tree."
+                                    .to_string(),
+                            )
+                        })?
+                        .to_string();
+                    let docs = match op {
+                        MongoStatement::Find(op) => {
+                            db::mongodb_driver::query_collection_owned(
+                                client,
+                                db_name,
+                                op.collection,
+                                op.filter,
+                                op.projection,
+                                op.sort,
+                                op.limit,
+                                op.skip as u64,
+                            )
+                            .await?
                         }
-                    });
-                    let docs = db::mongodb_driver::query_collection_owned(
-                        client,
-                        db_name.to_string(),
-                        op.collection,
-                        filter,
-                        None,
-                        None,
-                        op.limit,
-                        op.skip as u64,
-                    )
-                    .await?;
+                        MongoStatement::Aggregate(op) => {
+                            let mut pipeline = op.pipeline;
+
+                            if op.limit.is_none()
+                                && !pipeline.iter().any(|stage| stage.contains_key("$limit"))
+                            {
+                                pipeline.push(mongodb::bson::doc! { "$limit": 100i64 });
+                            }
+
+                            db::mongodb_driver::aggregate_collection_owned(
+                                client,
+                                db_name,
+                                op.collection,
+                                pipeline,
+                                op.limit,
+                                op.skip.map(|value| value as u64),
+                            )
+                            .await?
+                        }
+                    };
+
                     Ok(docs_to_query_result(&docs, &stmt))
                 } else {
                     Err(AppError::UnsupportedOperation(
-                        "Unsupported MongoDB syntax. Supported: db.collection.find({filter}).limit(n).skip(m)".to_string(),
+                        "Unsupported MongoDB syntax. Supported: db.collection.find(...), findOne(...), aggregate([...]) with optional sort/project/limit/skip".to_string(),
                     ))
                 }
             }
