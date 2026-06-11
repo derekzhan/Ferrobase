@@ -1,0 +1,423 @@
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import PagedResultViewer from './PagedResultViewer'
+import { useEditState } from '../hooks/useEditState'
+import { applyChanges } from '../lib/bridge'
+import { normalizeError } from '../lib/errors'
+import { DEFAULT_PAGE_SIZE } from '../lib/queryPaging'
+import { stripLeadingSqlComments } from '../lib/sqlText'
+import { toast } from '../lib/toast'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pagination helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ResultPanel
+// ─────────────────────────────────────────────────────────────────────────────
+const STATUS_TABS = ['Result', 'Messages', 'Plan']
+
+function unquoteIdentifier(identifier) {
+  const text = String(identifier ?? '').trim()
+  if (!text) return ''
+  if ((text.startsWith('`') && text.endsWith('`')) || (text.startsWith('"') && text.endsWith('"'))) {
+    return text.slice(1, -1).replace(/``/g, '`').replace(/""/g, '"')
+  }
+  return text
+}
+
+function splitQualifiedIdentifier(identifier) {
+  const parts = []
+  let current = ''
+  let quote = ''
+  for (const ch of String(identifier ?? '').trim()) {
+    if (quote) {
+      current += ch
+      if (ch === quote) quote = ''
+      continue
+    }
+    if (ch === '`' || ch === '"') {
+      quote = ch
+      current += ch
+      continue
+    }
+    if (ch === '.') {
+      parts.push(current.trim())
+      current = ''
+      continue
+    }
+    current += ch
+  }
+  if (current.trim()) parts.push(current.trim())
+  return parts.map(unquoteIdentifier).filter(Boolean)
+}
+
+function inferPrimaryKey(columns) {
+  const explicit = columns.find((col) => col?.isPrimaryKey || col?.key === 'PRI')
+  if (explicit?.name) return explicit.name
+  const id = columns.find((col) => String(col?.name ?? '').toLowerCase() === 'id')
+  return id?.name ?? ''
+}
+
+function inferSimpleSelectTarget(sql, columns, fallbackDb = '') {
+  const text = stripLeadingSqlComments(sql).replace(/;+$/g, '')
+  if (!/^select\b/i.test(text)) return null
+  if (/\b(join|union)\b/i.test(text)) return null
+
+  const match = text.match(/\bfrom\s+((?:`[^`]+`|"[^"]+"|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:`[^`]+`|"[^"]+"|[A-Za-z_][\w$]*))?)/i)
+  if (!match) return null
+
+  const afterFrom = text.slice(match.index + match[0].length)
+  if (/^\s*,/.test(afterFrom)) return null
+
+  const parts = splitQualifiedIdentifier(match[1])
+  const tableName = parts.length === 2 ? parts[1] : parts[0]
+  const dbName = parts.length === 2 ? parts[0] : fallbackDb
+  const primaryKey = inferPrimaryKey(columns)
+  if (!tableName || !primaryKey) return null
+  return { dbName, tableName, primaryKey }
+}
+
+/**
+ * @param {object} props
+ * @param {object|null} props.queryResult
+ *   The active result set's payload (already extracted by the caller).
+ * @param {boolean} props.isRunning
+ *   Whether a batch is still executing — controls the "Running…" label.
+ * @param {Array}   [props.resultSets]
+ *   Optional list of {id,label,sql,queryResult} entries.  When more than
+ *   one is present, ResultPanel renders a sub-tab strip under the status
+ *   tabs so the user can hop between per-statement results (Run All).
+ * @param {string|null} [props.activeResultId]
+ *   Which entry from `resultSets` is currently surfaced.  When omitted,
+ *   the strip defaults to the last entry.
+ * @param {Function} [props.onSelectResult]
+ *   Called with `(resultId)` when the user clicks a sub-tab.
+ */
+export default function ResultPanel({
+  queryResult    = null,
+  isRunning      = false,
+  resultSets     = null,
+  activeResultId = null,
+  onSelectResult,
+  onLoadMore,
+  onPageSizeChange,
+  onCancelQuery,
+  connectionId = '',
+  fallbackDb = '',
+}) {
+  const [activeTab,    setActiveTab]    = useState('Result')
+  const [fetchStats,   setFetchStats]   = useState(null)
+  const [valuePanelStateByResult, setValuePanelStateByResult] = useState({})
+
+  // ── Timing tracking ────────────────────────────────────────────────────
+  // Record the JS-side start time when isRunning flips to true, then compute
+  // fetchMs (total round-trip) when the result arrives.
+  const fetchStartRef = useRef(null)
+
+  useEffect(() => {
+    if (isRunning) {
+      fetchStartRef.current = performance.now()
+    }
+  }, [isRunning])
+
+  useEffect(() => {
+    if (!isRunning && queryResult && !queryResult.error && fetchStartRef.current !== null) {
+      const fetchMs = Math.round(performance.now() - fetchStartRef.current)
+      setFetchStats({
+        rowCount:  queryResult.rows?.length ?? 0,
+        execMs:    queryResult.execMs ?? 0,
+        fetchMs,
+        timestamp: new Date(),
+      })
+      fetchStartRef.current = null
+    }
+    if (!isRunning && queryResult?.error) {
+      // Clear stale stats on error
+      fetchStartRef.current = null
+    }
+  }, [queryResult, isRunning])
+
+  const hasResult = queryResult !== null
+  const hasError  = hasResult && !!queryResult.error
+  // Wails marshals Go's nil slices as JSON `null`.  Statements that have no
+  // result set (USE, SET, CREATE/DROP, most DML) therefore come back with
+  // `columns: null, rows: null` — coerce both to [] so every downstream
+  // array access (.length, .map, .forEach) is safe.
+  const cols      = hasResult && !hasError && Array.isArray(queryResult.columns) ? queryResult.columns : []
+  const allRows   = hasResult && !hasError && Array.isArray(queryResult.rows)    ? queryResult.rows    : []
+  const totalRows = allRows.length
+  // A statement is "result-set-less" when it executed fine but produced no
+  // grid (USE, CREATE TABLE, SET …, most DML).  We show a tidy success
+  // panel instead of an empty DataViewer so the user gets confirmation.
+  const isEmptyResultSet = hasResult && !hasError && cols.length === 0
+
+  const execMs    = hasResult ? queryResult.execMs : 0
+
+  // ── Edit state (Phase 6.8) ─────────────────────────────────────────────
+  // queryResult is used as resetKey: every new query clears all pending edits.
+  const editState = useEditState(cols, allRows, queryResult)
+  const activeResultEntry = Array.isArray(resultSets)
+    ? (resultSets.find((entry) => entry.id === activeResultId) ?? resultSets[resultSets.length - 1])
+    : null
+  const activeResultIndex = Array.isArray(resultSets)
+    ? resultSets.findIndex((entry) => entry.id === activeResultEntry?.id)
+    : 0
+  const activeResultPanelKey = String(Math.max(activeResultIndex, 0))
+  const valuePanelState = valuePanelStateByResult[activeResultPanelKey] ?? {}
+  const setActiveValuePanelOpen = useCallback((open) => {
+    setValuePanelStateByResult((prev) => ({
+      ...prev,
+      [activeResultPanelKey]: { ...prev[activeResultPanelKey], open },
+    }))
+  }, [activeResultPanelKey])
+  const setActiveValuePanelCell = useCallback((cell) => {
+    setValuePanelStateByResult((prev) => ({
+      ...prev,
+      [activeResultPanelKey]: { ...prev[activeResultPanelKey], cell },
+    }))
+  }, [activeResultPanelKey])
+  const activeResultSql = activeResultEntry?.sql ?? ''
+  const queryEditTarget = useMemo(
+    () => inferSimpleSelectTarget(queryResult?.source?.sql ?? activeResultSql, cols, queryResult?.source?.dbName || queryResult?.dbName || fallbackDb),
+    [activeResultSql, cols, fallbackDb, queryResult?.dbName, queryResult?.source?.dbName, queryResult?.source?.sql],
+  )
+  const canSaveQueryEdits = !!queryEditTarget && !!connectionId
+  const handleSaveQueryEdits = useCallback(async () => {
+    if (!queryEditTarget || !connectionId || !editState.isDirty) return
+    const changeSet = editState.buildChangeSet({
+      connectionId,
+      database: queryEditTarget.dbName,
+      tableName: queryEditTarget.tableName,
+      primaryKey: queryEditTarget.primaryKey,
+    })
+    if (!changeSet) return
+
+    try {
+      const result = await applyChanges(changeSet)
+      if (result?.error) {
+        toast.error(`Save failed: ${result.error}`)
+        return
+      }
+      toast.success('Saved changes')
+      if (onPageSizeChange && queryResult?.source) {
+        const reloadSize = Math.max(
+          queryResult.rows?.length ?? 0,
+          queryResult.pageSize ?? queryResult.source.pageSize ?? DEFAULT_PAGE_SIZE,
+        )
+        await onPageSizeChange(reloadSize)
+      } else {
+        editState.clear()
+      }
+    } catch (err) {
+      toast.error(`Save failed: ${normalizeError(err)}`)
+    }
+  }, [connectionId, editState, onPageSizeChange, queryEditTarget, queryResult])
+
+  return (
+    <div className="flex flex-col h-full bg-app border-t border-line">
+
+      {/* ── Status tab bar ───────────────────────────────────────────── */}
+      <div className="flex items-center bg-titlebar border-b border-line-subtle flex-shrink-0">
+        {STATUS_TABS.map((tab) => (
+          <button
+            key={tab}
+            onClick={() => setActiveTab(tab)}
+            className={[
+              'px-4 py-2 text-[13px] border-r border-line-subtle transition-colors select-none',
+              tab === activeTab
+                ? 'bg-app text-fg-primary border-t-2 border-t-accent'
+                : 'text-fg-muted hover:text-fg-primary hover:bg-hover',
+            ].join(' ')}
+          >
+            {tab}
+          </button>
+        ))}
+
+        <div className="ml-auto flex items-center gap-3 px-3 text-[11px] text-fg-muted">
+          {isRunning && <span className="text-accent animate-pulse">Running…</span>}
+          {isRunning && onCancelQuery && (
+            <button
+              onClick={onCancelQuery}
+              title="Cancel running query"
+              className="text-[11px] px-2 py-0.5 rounded border border-danger text-danger
+                         hover:bg-danger hover:text-white transition-colors select-none"
+            >
+              ✕ Cancel
+            </button>
+          )}
+          {activeTab === 'Result' && hasResult && !hasError && !isEmptyResultSet && (
+            <span className={queryResult.truncated && !queryResult.hasMore ? 'text-warn' : ''}>
+              {totalRows.toLocaleString()} rows shown
+              {queryResult.hasMore ? ' · scroll to load more' : queryResult.truncated ? ' · limit reached' : ''}
+              {' · '}{cols.length} cols
+            </span>
+          )}
+          {activeTab === 'Result' && isEmptyResultSet && queryResult.rowsAffected > 0 && (
+            <span className="text-success">
+              {queryResult.rowsAffected.toLocaleString()} row(s) affected
+            </span>
+          )}
+          {hasResult && <span>{execMs} ms</span>}
+        </div>
+      </div>
+
+      {/* ── Multi-result sub-tab strip ──────────────────────────────────
+          Visible only when Run All produced more than one result set.
+          Each sub-tab corresponds to one statement and shows a small
+          status glyph: ✓ success, ✗ error, … still running. */}
+      {Array.isArray(resultSets) && resultSets.length > 1 && activeTab === 'Result' && (
+        <div className="flex items-center bg-elevated border-b border-line-subtle flex-shrink-0 overflow-x-auto">
+          {resultSets.map((r, idx) => {
+            const err   = r.queryResult?.error
+            const glyph = err ? '✗' : '✓'
+            const color = err ? 'text-danger' : 'text-success'
+            const active = r.id === activeResultId
+            return (
+              <button
+                key={r.id}
+                onClick={() => onSelectResult?.(r.id)}
+                title={r.sql}
+                className={[
+                  'flex items-center gap-2 px-3 py-1 text-[11px] border-r border-line-subtle',
+                  'select-none flex-shrink-0 transition-colors',
+                  active
+                    ? 'bg-app text-fg-primary border-t-2 border-t-accent'
+                    : 'text-fg-muted hover:text-fg-primary hover:bg-hover',
+                ].join(' ')}
+              >
+                <span className={color}>{glyph}</span>
+                <span>Result {idx + 1}</span>
+                <span className="text-fg-muted truncate max-w-[140px]">{r.label}</span>
+              </button>
+            )
+          })}
+        </div>
+      )}
+
+      {/* ── Panel body ───────────────────────────────────────────────── */}
+      <div className="flex-1 overflow-hidden flex flex-col min-h-0">
+
+        {/* ── Result tab ──────────────────────────────────────────────── */}
+        {activeTab === 'Result' && (
+          <>
+            {isRunning && (
+              <div className="flex-1 flex flex-col items-center justify-center gap-4 text-fg-muted text-[13px]">
+                <span className="animate-pulse">Executing query…</span>
+                {onCancelQuery && (
+                  <button
+                    onClick={onCancelQuery}
+                    title="Cancel running query"
+                    className="text-[12px] px-3 py-1 rounded border border-danger text-danger
+                               hover:bg-danger hover:text-white transition-colors select-none"
+                  >
+                    ✕ Cancel query
+                  </button>
+                )}
+              </div>
+            )}
+            {!isRunning && !hasResult && (
+              <div className="flex-1 flex items-center justify-center text-fg-muted text-[13px] select-none gap-2">
+                Press
+                <kbd className="px-1.5 py-0.5 bg-elevated border border-line-subtle rounded text-[11px] text-accent-text">Cmd+Enter</kbd>
+                to run the query
+              </div>
+            )}
+            {!isRunning && hasError && (
+              <div className="flex-1 p-4 font-mono text-[13px] overflow-auto">
+                <div className="text-danger font-semibold mb-1">Query error</div>
+                <pre className="text-fg-primary whitespace-pre-wrap">{queryResult.error}</pre>
+              </div>
+            )}
+            {!isRunning && isEmptyResultSet && (
+              <div className="flex-1 p-4 font-mono text-[13px] overflow-auto select-text">
+                <div className="text-success font-semibold mb-1">
+                  ✓ Statement executed successfully
+                </div>
+                <div className="text-fg-primary">
+                  {queryResult.rowsAffected > 0
+                    ? `${queryResult.rowsAffected.toLocaleString()} row(s) affected`
+                    : 'No rows affected'}
+                  {' · '}{execMs} ms
+                </div>
+                <div className="text-fg-muted text-[11px] mt-2">
+                  This statement returned no result set.
+                </div>
+              </div>
+            )}
+            {!isRunning && hasResult && !hasError && !isEmptyResultSet && (
+              <PagedResultViewer
+                columns={cols}
+                rows={allRows}
+                execMs={execMs}
+                truncated={queryResult.truncated}
+                hasMore={!!queryResult.hasMore}
+                loadingMore={!!queryResult.loadingMore}
+                capped={queryResult.truncated && !queryResult.hasMore}
+                pageSize={queryResult.pageSize ?? DEFAULT_PAGE_SIZE}
+                onLoadMore={onLoadMore}
+                onPageSizeChange={queryResult.source ? onPageSizeChange : undefined}
+                exportFilename="query_result.csv"
+                fetchStats={fetchStats}
+                editState={canSaveQueryEdits ? editState : undefined}
+                isDirty={canSaveQueryEdits && editState.isDirty}
+                hasSelection={canSaveQueryEdits && editState.selectedRow !== null}
+                onAddRow={canSaveQueryEdits ? editState.addRow : undefined}
+                onDuplicateRow={canSaveQueryEdits ? () => editState.duplicateRow() : undefined}
+                onDeleteRow={canSaveQueryEdits ? () => editState.deleteRow() : undefined}
+                onSave={canSaveQueryEdits ? handleSaveQueryEdits : undefined}
+                onCancel={editState.cancel}
+                valuePanelOpen={!!valuePanelState.open}
+                onValuePanelOpenChange={setActiveValuePanelOpen}
+                valuePanelCell={valuePanelState.cell ?? null}
+                onValuePanelCellChange={setActiveValuePanelCell}
+              />
+            )}
+          </>
+        )}
+
+        {/* ── Messages tab ────────────────────────────────────────────── */}
+        {activeTab === 'Messages' && (
+          <div className="p-4 font-mono text-[13px] space-y-1 overflow-auto">
+            {!hasResult
+              ? <div className="text-fg-muted">No query run yet.</div>
+              : hasError
+                ? (
+                  <>
+                    <div className="text-danger font-semibold">✗ Error</div>
+                    <pre className="text-fg-primary whitespace-pre-wrap text-[12px]">{queryResult.error}</pre>
+                  </>
+                )
+                : (
+                  <>
+                    <div className="text-success">✓ Query executed successfully</div>
+                    <div className="text-fg-primary">
+                      {totalRows.toLocaleString()} row(s) in {execMs} ms
+                      {queryResult.hasMore && <span className="text-fg-muted"> — scroll to load more</span>}
+                      {queryResult.truncated && !queryResult.hasMore && <span className="text-warn"> — result limited to {totalRows.toLocaleString()} rows</span>}
+                    </div>
+                    {queryResult.rowsAffected > 0 && (
+                      <div className="text-fg-primary">{queryResult.rowsAffected.toLocaleString()} row(s) affected</div>
+                    )}
+                    <div className="text-fg-muted mt-2">Connection: localhost:3306 / db1</div>
+                    {fetchStats && (
+                      <div className="text-fg-muted text-[11px] mt-1">
+                        JS fetch time: {fetchStats.fetchMs} ms (backend: {fetchStats.execMs} ms)
+                      </div>
+                    )}
+                  </>
+                )
+            }
+          </div>
+        )}
+
+        {/* ── Plan tab ────────────────────────────────────────────────── */}
+        {activeTab === 'Plan' && (
+          <div className="p-4 font-mono text-[13px] text-fg-muted">
+            No execution plan available. Prefix your query with{' '}
+            <span className="text-accent-text font-semibold">EXPLAIN</span> to see the plan.
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}

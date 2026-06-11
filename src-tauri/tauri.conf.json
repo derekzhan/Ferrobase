@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/schema.json",
   "productName": "Ferrobase",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "identifier": "app.ferrobase.client",
   "build": {
     "beforeDevCommand": "npm run dev",

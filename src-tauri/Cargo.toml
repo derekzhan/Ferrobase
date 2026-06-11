@@ -1,9 +1,9 @@
 [package]
 name = "ferrobase"
-version = "0.1.2"
-description = "Ferrobase - Lightweight Cross-Platform Database Client"
+version = "0.2.0"
+description = "Ferrobase - Lightweight Cross-Platform Database IDE (MySQL / MongoDB / Redis)"
 authors = ["Ferrobase Contributors"]
-license = "Apache-2.0"
+license = "MIT"
 repository = "https://github.com/derekzhan/Ferrobase"
 default-run = "ferrobase"
 edition = "2021"
@@ -23,13 +23,12 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
-tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-json5 = "0.4"
 tokio = { version = "1", features = ["full"] }
 thiserror = "1"
+anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 keyring = "2"
@@ -37,12 +36,14 @@ base64 = "0.22"
 once_cell = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "5"
+open = "5"
+futures = "0.3"
 
-# Database drivers
+# Relational
 sqlx = { version = "0.8", features = [
   "runtime-tokio-native-tls",
   "mysql",
-  "postgres",
   "sqlite",
   "chrono",
   "uuid",
@@ -58,23 +59,18 @@ bson = { version = "2", features = ["chrono-0_4"] }
 # Redis
 redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 
-# Async utilities
-futures = "0.3"
-
-# SSH tunneling
-russh = { version = "0.44", optional = true }
-russh-keys = { version = "0.44", optional = true }
+# Value decoders (Redis "decode value" feature)
+flate2 = "1"
+rmp-serde = "1"
+serde-pickle = "1"
 
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
-ssh-tunnel = ["russh", "russh-keys"]
 
-# Dev builds: fast compile, no optimizations
 [profile.dev]
 opt-level = 0
 
-# Release builds: full optimization for distribution
 [profile.release]
 panic = "abort"
 codegen-units = 1

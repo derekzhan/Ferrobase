@@ -1,12 +1,27 @@
-mod commands;
-mod db;
-mod models;
-mod pool;
-mod error;
+mod bridge;
+pub mod conn;
+pub mod models;
+pub mod mongo;
+pub mod mysql;
+pub mod redis_drv;
+mod secret;
+pub mod state;
+pub mod store;
+pub mod util;
 
-use commands::{connection, schema, query, mongo, redis_cmd, export};
-use tauri::menu::{MenuBuilder, SubmenuBuilder, MenuItemBuilder, PredefinedMenuItem};
-use tauri::Emitter;
+use serde_json::Value;
+use state::AppState;
+use tauri::{Emitter, State};
+
+#[tauri::command]
+async fn bridge_call(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    method: String,
+    args: Vec<Value>,
+) -> Result<Value, String> {
+    bridge::dispatch(app, state.inner(), &method, args).await
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -17,129 +32,92 @@ pub fn run() {
         )
         .try_init();
 
-    let builder = tauri::Builder::default()
+    let opened = tauri::async_runtime::block_on(async { store::open().await })
+        .expect("failed to open local database");
+    let app_state = AppState::new(opened.pool, opened.path);
+
+    tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
-        .manage(pool::ConnectionRegistry::new())
+        .manage(app_state)
         .setup(|app| {
-            // Build custom menu to intercept "About" and show our custom dialog
-            let about_item = MenuItemBuilder::with_id("custom_about", "About Ferrobase")
-                .build(app)?;
-            let separator = PredefinedMenuItem::separator(app)?;
-            let hide = PredefinedMenuItem::hide(app, Some("Hide Ferrobase"))?;
-            let hide_others = PredefinedMenuItem::hide_others(app, Some("Hide Others"))?;
-            let show_all = PredefinedMenuItem::show_all(app, Some("Show All"))?;
-            let quit = PredefinedMenuItem::quit(app, Some("Quit Ferrobase"))?;
-            let services = SubmenuBuilder::new(app, "Services")
-                .services()
-                .build()?;
-
-            let app_menu = SubmenuBuilder::new(app, "Ferrobase")
-                .item(&about_item)
-                .item(&separator)
-                .item(&services)
-                .item(&PredefinedMenuItem::separator(app)?)
-                .item(&hide)
-                .item(&hide_others)
-                .item(&show_all)
-                .item(&PredefinedMenuItem::separator(app)?)
-                .item(&quit)
-                .build()?;
-
-            let edit_menu = SubmenuBuilder::new(app, "Edit")
-                .undo()
-                .redo()
-                .separator()
-                .cut()
-                .copy()
-                .paste()
-                .select_all()
-                .build()?;
-
-            let view_menu = SubmenuBuilder::new(app, "View")
-                .fullscreen()
-                .build()?;
-
-            let window_menu = SubmenuBuilder::new(app, "Window")
-                .minimize()
-                .separator()
-                .close_window()
-                .build()?;
-
-            let menu = MenuBuilder::new(app)
-                .item(&app_menu)
-                .item(&edit_menu)
-                .item(&view_menu)
-                .item(&window_menu)
-                .build()?;
-
-            app.set_menu(menu)?;
-
-            // Handle custom About menu click → emit event to frontend
-            let handle = app.handle().clone();
-            app.on_menu_event(move |_app_handle, event| {
-                if event.id().0 == "custom_about" {
-                    let _ = handle.emit("show-about", ());
-                }
-            });
-
-            let handle2 = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = commands::connection::load_connections_from_disk(&handle2).await {
-                    eprintln!("Failed to load saved connections: {}", e);
-                }
-            });
+            #[cfg(target_os = "macos")]
+            build_macos_menu(app)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            // Connection management
-            connection::create_connection,
-            connection::update_connection,
-            connection::delete_connection,
-            connection::clone_connection,
-            connection::list_connections,
-            connection::test_connection,
-            connection::connect,
-            connection::disconnect,
-            connection::get_connection_status,
-            // Schema browsing
-            schema::get_databases,
-            schema::get_schemas,
-            schema::get_tables,
-            schema::get_table_columns,
-            schema::get_table_indexes,
-            schema::get_table_ddl,
-            schema::get_table_data_preview,
-            schema::get_views,
-            schema::get_procedures,
-            // Query execution
-            query::execute_query,
-            query::cancel_query,
-            query::get_query_history,
-            query::clear_query_history,
-            // MongoDB specific
-            mongo::list_collections,
-            mongo::query_collection,
-            mongo::insert_document,
-            mongo::update_document,
-            mongo::delete_document,
-            mongo::get_collection_indexes,
-            // Redis specific
-            redis_cmd::list_keys,
-            redis_cmd::get_key,
-            redis_cmd::set_key,
-            redis_cmd::delete_key,
-            redis_cmd::get_key_ttl,
-            redis_cmd::set_key_ttl,
-            redis_cmd::get_server_info,
-            redis_cmd::execute_redis_command,
-            // Export
-            export::export_query_result,
-        ]);
+        .invoke_handler(tauri::generate_handler![bridge_call])
+        .run(tauri::generate_context!())
+        .expect("error while running Ferrobase");
+}
 
-    if let Err(e) = builder.run(tauri::generate_context!()) {
-        eprintln!("Error while running Ferrobase: {}", e);
-        std::process::exit(1);
-    }
+#[cfg(target_os = "macos")]
+fn build_macos_menu(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
+
+    let about_item = MenuItemBuilder::with_id("ferro_about", "About Ferrobase").build(app)?;
+    let app_menu = SubmenuBuilder::new(app, "Ferrobase")
+        .item(&about_item)
+        .separator()
+        .item(&PredefinedMenuItem::services(app, None)?)
+        .separator()
+        .item(&PredefinedMenuItem::hide(app, None)?)
+        .item(&PredefinedMenuItem::hide_others(app, None)?)
+        .item(&PredefinedMenuItem::show_all(app, None)?)
+        .separator()
+        .item(&PredefinedMenuItem::quit(app, None)?)
+        .build()?;
+
+    let edit_menu = SubmenuBuilder::new(app, "Edit")
+        .undo()
+        .redo()
+        .separator()
+        .cut()
+        .copy()
+        .paste()
+        .select_all()
+        .build()?;
+
+    let window_menu = SubmenuBuilder::new(app, "Window")
+        .minimize()
+        .separator()
+        .close_window()
+        .build()?;
+
+    let settings_item = MenuItemBuilder::with_id("menu:settings", "Settings…")
+        .accelerator("CmdOrCtrl+,")
+        .build(app)?;
+    let tools_menu = SubmenuBuilder::new(app, "Tools").item(&settings_item).build()?;
+
+    let shortcuts_item = MenuItemBuilder::with_id("menu:shortcuts", "Keyboard Shortcuts").build(app)?;
+    let about2_item = MenuItemBuilder::with_id("menu:about", "About Ferrobase").build(app)?;
+    let help_menu = SubmenuBuilder::new(app, "Help")
+        .item(&shortcuts_item)
+        .item(&about2_item)
+        .build()?;
+
+    let menu = MenuBuilder::new(app)
+        .item(&app_menu)
+        .item(&edit_menu)
+        .item(&window_menu)
+        .item(&tools_menu)
+        .item(&help_menu)
+        .build()?;
+    app.set_menu(menu)?;
+
+    app.on_menu_event(move |app_handle, event| {
+        let id = event.id().0.as_str();
+        match id {
+            "ferro_about" | "menu:about" => {
+                let _ = app_handle.emit("menu:about", ());
+            }
+            "menu:settings" => {
+                let _ = app_handle.emit("menu:settings", ());
+            }
+            "menu:shortcuts" => {
+                let _ = app_handle.emit("menu:shortcuts", ());
+            }
+            _ => {}
+        }
+    });
+    Ok(())
 }

@@ -1,0 +1,2210 @@
+/**
+ * DatabaseExplorer — lazy-loading database tree (B2).
+ *
+ * Tree structure & lazy-load strategy
+ * ────────────────────────────────────
+ *   connection ──(expand)──► fetchDatabases(connId)           [IPC / ~80 ms]
+ *   database   ──(expand)──► fetchTables(connId, dbName)      [IPC / ~80 ms]
+ *   table      ──(expand)──► getTableSchema(…).columns        [SQLite / < 1 ms]
+ *   column     ──(leaf)────► no children
+ *
+ * Columns come from the local SQLite cache (getTableSchema) rather than the
+ * live database, so expanding a table is always instant once the sync has run.
+ *
+ * State model
+ * ───────────
+ *   connections  — ConnectionInfo[] loaded once on mount
+ *   expanded     — Set<nodeId>  (toggle on arrow click)
+ *   nodeCache    — Map<nodeId, CacheEntry> where
+ *                    CacheEntry = { status: 'loading'|'loaded'|'error', children: Node[], error: string }
+ *   searchQuery  — substring search across loaded table (and related) node
+ *                  labels, **only for connections with connected === true**;
+ *                  When the field is empty the full connection list (including
+ *                  disconnected) is shown as before.
+ *
+ * Cleanup
+ * ───────
+ * Each fetchChildren call uses a local `cancelled` flag so stale Promises
+ * can never update state after a re-fetch or component unmount.
+ */
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import CreateDatabaseModal from './CreateDatabaseModal'
+import CreateTableModal from './CreateTableModal'
+import TableActionModal from './TableActionModal'
+import IndexActionModal from './IndexActionModal'
+import CreateIndexModal from './CreateIndexModal'
+import {
+  LayoutGrid, Plus, Search, X,
+  // Tree-node glyphs.  All of these are thin-stroke Lucide icons (strokeWidth
+  // 1.7 by default in this palette) so the sidebar reads as a quiet,
+  // consistent system — no more mixed-metric emoji that jump around when the
+  // OS changes its emoji font.
+  ChevronRight, ChevronDown, Loader2, AlertCircle,
+  Database, Leaf, Table2, Columns as ColumnsIcon,
+  Eye, KeyRound, Users as UsersIcon, UserRound,
+  Settings2, Info, Cable, RotateCw, Link2, Plug, Unplug,
+  FolderOpen, FolderTree, Key, Server,
+  ListChecks, Play, Zap, Bell, Code2, Copy, Pencil, Trash2,
+} from 'lucide-react'
+import {
+  listConnections, fetchDatabases, fetchTables, getTableSchema, getTableAdvancedProperties,
+  fetchRoutines, fetchTriggers, fetchEvents,
+  runQuery, syncMetadata, connect, connectSaved, disconnect, refreshTableMetadata,
+  getTableUsage, recordTableUsage, redisScanKeys,
+  redisSetString, redisHashSet, redisListPush, redisSetAdd, redisZAdd, redisStreamAdd,
+} from '../lib/bridge'
+import { buildKeyTree } from '../lib/redisClient'
+import AddRedisKeyModal from './AddRedisKeyModal'
+import { normalizeError } from '../lib/errors'
+import { toast } from '../lib/toast'
+import { buildCreateDatabaseSql, buildDropTableSql, buildRenameTableSql, quoteSqlIdentifier } from '../lib/databaseTemplates'
+import { databaseScopeFromSelection, tablesFolderIdForScope } from '../lib/explorerSearch'
+import { bumpTableUsage, sortTablesByUsage } from '../lib/tableUsage'
+import { formatBytes } from '../utils/formatters'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Node ID helpers — deterministic, readable
+// ─────────────────────────────────────────────────────────────────────────────
+const connNodeId  = (cid)                       => `conn::${cid}`
+const groupId     = (cid, kind)                 => `group::${kind}::${cid}`
+const dbNodeId    = (cid, db)                   => `db::${cid}::${db}`
+const tableNodeId = (cid, db, tbl)              => `tbl::${cid}::${db}::${tbl}`
+const colNodeId   = (cid, db, tbl, col)         => `col::${cid}::${db}::${tbl}::${col}`
+const collFolderId = (cid, db, tbl, kind)       => `collfolder::${kind}::${cid}::${db}::${tbl}`
+const indexNodeId  = (cid, db, tbl, idx)        => `idx::${cid}::${db}::${tbl}::${idx}`
+const userNodeId  = (cid, user, host)           => `user::${cid}::${user}@${host}`
+const sysInfoId   = (cid, key)                  => `sysinfo::${cid}::${key}`
+const adminId     = (cid, key)                  => `admin::${cid}::${key}`
+const redisKeyFolderId = (cid, db, path)        => `rediskeyfolder::${cid}::${db}::${path}`
+const redisKeyId       = (cid, db, key)         => `rediskey::${cid}::${db}::${key}`
+
+// db0 → 0, db15 → 15.  Falls back to 0 for anything unexpected.
+const dbIndexFromLabel = (dbName) => parseInt(String(dbName).replace(/^db/, ''), 10) || 0
+
+// Map the recursive key-tree (from buildKeyTree) into explorer nodes.  The whole
+// tree is materialised up-front from a single SCAN page, so folder expansion is
+// just a lookup of the precomputed `redisChildren`.
+function materializeRedisTree(nodes, connId, dbName) {
+  return nodes.map((n) => {
+    if (n.leaf) {
+      return {
+        id:    redisKeyId(connId, dbName, n.key),
+        type:  'rediskey',
+        label: n.label,
+        connId, dbName,
+        redisKey:       n.key,
+        connectionKind: 'redis',
+        hasChildren:    false,
+      }
+    }
+    return {
+      id:    redisKeyFolderId(connId, dbName, n.path),
+      type:  'rediskeyfolder',
+      label: n.label,
+      connId, dbName,
+      redisPath:      n.path,
+      connectionKind: 'redis',
+      hasChildren:    true,
+      redisChildren:  materializeRedisTree(n.children, connId, dbName),
+    }
+  })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tree icon system
+//
+// The tree used to mix emoji (🔌 🗄 ▦ 👥 ⚙ ℹ⋯) which looked inconsistent across
+// macOS / Windows / Linux and changed metrics per-row, making the sidebar feel
+// noisy.  We swap to a curated Lucide set with a distinct tint per node kind
+// so the eye can scan the hierarchy quickly:
+//
+//   connection:mysql   Database    teal   (#4ec9b0 — "live" colour)
+//   connection:mongodb Leaf        teal   (#4ec9b0 — "live" colour)
+//   group: databases   Database    green  (#4ec9b0)
+//   database           Database    green  (#4ec9b0 — matches the label)
+//   folder: tables     FolderTree  muted  (#858585)
+//   folder: views      Eye         muted  (#858585)
+//   table              Table2      soft   (#d4d4d4)
+//   view               Eye         soft   (#d4d4d4)
+//   column (normal)    Columns     blue   (#9cdcfe — matches label)
+//   column (PK)        KeyRound    gold   (#dcdcaa)
+//   group: users       Users       mauve  (#c586c0)
+//   user leaf          UserRound   mauve  (#c586c0)
+//   group: administer  Settings2   gold   (#dcdcaa)
+//   administer leaf    Cable       blue   (#9cdcfe)
+//   group: sysinfo     Info        blue   (#9cdcfe)
+//   sysinfo leaf       Info        blue   (#9cdcfe)
+//
+// All helpers below reject unknown types to `null` so a future refactor can't
+// silently render a weird placeholder.
+// ─────────────────────────────────────────────────────────────────────────────
+const NODE_ICON_SIZE        = 13
+const NODE_ICON_STROKE      = 1.7
+const CHEVRON_SIZE          = 11
+const STATUS_INDICATOR_SIZE = 11
+
+/**
+ * TreeIcon — renders the correct Lucide icon + tint for a given tree node.
+ * Props: { type, folderKind, groupKind, kind, isPK, className }
+ *
+ * Returns a 14×14 SVG wrapped in a flex-shrink-0 span so the column layout
+ * stays stable whether or not we render a chevron before it.
+ */
+function TreeIcon({ type, folderKind, groupKind, kind, isPK, className = '' }) {
+  let Cmp   = null
+  // Use CSS custom properties so the icons re-tint when the theme changes.
+  let color = 'var(--fg-muted)'  // default (folders, unknown)
+
+  if (type === 'connection' && kind === 'mongodb') { Cmp = Leaf;      color = 'var(--success)' }
+  else if (type === 'connection')                 { Cmp = Database;   color = 'var(--success)' }
+  else if (type === 'database')                   { Cmp = Database;   color = 'var(--success)' }
+  else if (type === 'table' && kind === 'collection') { Cmp = Table2; color = 'var(--accent)' }
+  else if (type === 'table' && kind === 'view')   { Cmp = Eye;        color = 'var(--fg-secondary)' }
+  else if (type === 'table')                      { Cmp = Table2;     color = 'var(--fg-secondary)' }
+  else if (type === 'column' && isPK)             { Cmp = KeyRound;   color = 'var(--syntax-pk)' }
+  else if (type === 'column')                     { Cmp = ColumnsIcon;color = 'var(--syntax-keyword)' }
+  else if (type === 'collfolder' && folderKind === 'indexes') { Cmp = ListChecks; color = 'var(--fg-muted)' }
+  else if (type === 'collfolder')                 { Cmp = ColumnsIcon; color = 'var(--fg-muted)' }
+  else if (type === 'index' && (isPK || kind === 'unique')) { Cmp = KeyRound;   color = 'var(--syntax-pk)' }
+  else if (type === 'index')                      { Cmp = ListChecks; color = 'var(--syntax-keyword)' }
+  else if (type === 'user')                       { Cmp = UserRound;  color = 'var(--syntax-user)' }
+  else if (type === 'admin')                      { Cmp = Cable;      color = 'var(--syntax-keyword)' }
+  else if (type === 'sysinfo')                    { Cmp = Info;       color = 'var(--syntax-keyword)' }
+  else if (type === 'folder' && folderKind === 'tables')   { Cmp = FolderTree; color = 'var(--fg-muted)' }
+  else if (type === 'folder' && folderKind === 'views')    { Cmp = Eye;        color = 'var(--fg-muted)' }
+  else if (type === 'folder' && folderKind === 'routines') { Cmp = Code2;      color = 'var(--fg-muted)' }
+  else if (type === 'folder' && folderKind === 'triggers') { Cmp = Zap;        color = 'var(--fg-muted)' }
+  else if (type === 'folder' && folderKind === 'events')   { Cmp = Bell;       color = 'var(--fg-muted)' }
+  else if (type === 'rediskeyfolder')                      { Cmp = FolderTree; color = 'var(--fg-muted)' }
+  else if (type === 'rediskey')                            { Cmp = Key;        color = 'var(--syntax-keyword)' }
+  else if (type === 'folder')                              { Cmp = FolderOpen; color = 'var(--fg-muted)' }
+  else if (type === 'group' && groupKind === 'connection') { Cmp = FolderTree; color = 'var(--fg-muted)' }
+  else if (type === 'group' && groupKind === 'databases')  { Cmp = Database;  color = 'var(--success)' }
+  else if (type === 'group' && groupKind === 'users')      { Cmp = UsersIcon; color = 'var(--syntax-user)' }
+  else if (type === 'group' && groupKind === 'administer') { Cmp = Settings2; color = 'var(--syntax-pk)' }
+  else if (type === 'group' && groupKind === 'sysinfo')    { Cmp = Info;      color = 'var(--syntax-keyword)' }
+
+  if (!Cmp) return null
+  return (
+    <span className={`inline-flex items-center justify-center flex-shrink-0 ${className}`}
+          style={{ width: 14, height: 14 }}>
+      <Cmp size={NODE_ICON_SIZE} strokeWidth={NODE_ICON_STROKE} color={color} />
+    </span>
+  )
+}
+
+/**
+ * labelColorFor — returns the CSS variable that should colour the label of
+ * a tree node.  Kept symmetrical with TreeIcon so icon + label tints stay
+ * consistent, and so a single token swap (e.g. when the theme flips) updates
+ * both at once.
+ */
+function labelColorFor(node) {
+  if (node.type === 'column' && node.isPK) return 'var(--syntax-pk)'
+  if (node.type === 'column')               return 'var(--syntax-keyword)'
+  if (node.type === 'collfolder')           return 'var(--fg-muted)'
+  if (node.type === 'index' && (node.isPK || node.kind === 'unique')) return 'var(--syntax-pk)'
+  if (node.type === 'index')                return 'var(--fg-primary)'
+  if (node.type === 'table')                return 'var(--fg-primary)'
+  if (node.type === 'database')             return 'var(--success)'
+  if (node.type === 'folder')               return 'var(--fg-muted)'
+  if (node.type === 'group')                return 'var(--fg-secondary)'
+  if (node.type === 'user')                 return 'var(--syntax-user)'
+  if (node.type === 'admin')                return 'var(--syntax-keyword)'
+  if (node.type === 'sysinfo')              return 'var(--syntax-keyword)'
+  if (node.type === 'rediskey')             return 'var(--fg-primary)'
+  if (node.type === 'rediskeyfolder')       return 'var(--fg-muted)'
+  return 'var(--fg-secondary)'
+}
+
+/**
+ * MenuLabel — tiny wrapper used inside the right-click menu so each action
+ * gets a proper 12×12 Lucide glyph instead of an ad-hoc emoji.  Kept separate
+ * from TreeIcon because the menu has its own spacing conventions and never
+ * needs coloured tints (the active row already paints everything white).
+ */
+function MenuLabel({ icon: Icon, text }) {
+  return (
+    <span className="inline-flex items-center gap-2">
+      <Icon size={13} strokeWidth={1.8} className="flex-shrink-0 opacity-80" />
+      <span className="truncate">{text}</span>
+    </span>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-connection top-level groups (Phase 22)
+//
+// Each connection expands into 4 fixed virtual folders.  Order matters: it
+// determines the rendering sequence in the tree.
+// ─────────────────────────────────────────────────────────────────────────────
+const CONN_GROUPS = [
+  { kind: 'databases',  label: 'Databases'   },
+  { kind: 'users',      label: 'Users'       },
+  { kind: 'administer', label: 'Administer'  },
+  { kind: 'sysinfo',    label: 'System Info' },
+]
+
+function groupsForConnectionKind(kind) {
+  // Redis, like MongoDB, only exposes the Databases group (no Users / Administer
+  // / System Info).  Keep the mongodb ternary intact for clarity & test parity.
+  if (kind === 'redis') return CONN_GROUPS.filter((g) => g.kind === 'databases')
+  return kind === 'mongodb' ? CONN_GROUPS.filter((g) => g.kind === 'databases') : CONN_GROUPS
+}
+
+const DATABASE_FOLDERS = [
+  { kind: 'tables', label: 'Tables' },
+  { kind: 'routines', label: 'Procedures & Functions' },
+  { kind: 'triggers', label: 'Triggers' },
+  { kind: 'events', label: 'Events' },
+]
+
+function databaseFoldersForConnectionKind(kind) {
+  return kind === 'mongodb' ? DATABASE_FOLDERS.filter((f) => f.kind === 'tables') : DATABASE_FOLDERS
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Static catalogues for the Administer / System Info groups.
+//
+// Each entry becomes a leaf node that opens a read-only QueryTabView when
+// double-clicked.  `key` is used in the node id so different leaves never
+// collide; `label` is what the user sees.
+// ─────────────────────────────────────────────────────────────────────────────
+const ADMIN_ITEMS = [
+  { key: 'session_manager', label: 'Session Manager', sql: 'SHOW FULL PROCESSLIST' },
+]
+
+const SYSINFO_ITEMS = [
+  { key: 'session_status',    label: 'Session Status',    sql: 'SHOW SESSION STATUS'    },
+  { key: 'global_status',     label: 'Global Status',     sql: 'SHOW GLOBAL STATUS'     },
+  { key: 'session_variables', label: 'Session Variables', sql: 'SHOW SESSION VARIABLES' },
+  { key: 'global_variables',  label: 'Global Variables',  sql: 'SHOW GLOBAL VARIABLES'  },
+  { key: 'engines',           label: 'Engines',           sql: 'SHOW ENGINES'           },
+  { key: 'charsets',          label: 'Charsets',          sql: 'SHOW CHARACTER SET'     },
+  { key: 'user_privileges',   label: 'User Privileges',
+    sql: 'SELECT * FROM information_schema.USER_PRIVILEGES' },
+  { key: 'plugin',            label: 'Plugin',            sql: 'SHOW PLUGINS'           },
+]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Filter helpers
+//
+// matchesLabel
+//   Pure substring, case-insensitive.  Empty query always matches.
+//
+// subtreeMatches
+//   Recursively determines whether `node` (or any of its already-loaded
+//   descendants in nodeCache) contains a match for the query.  Used by
+//   TreeBranch / ConnectionRow so that matching children keep their parent
+//   chain visible even when the parent label itself does not match.
+//
+//   We intentionally only walk the already-loaded cache — we do NOT fire off
+//   lazy fetches while the user types.  The tree is eagerly populated the
+//   moment a user expands each connection, so in practice this catches every
+//   visible schema once the connection has been clicked once.
+// ─────────────────────────────────────────────────────────────────────────────
+const matchesLabel = (text, q) =>
+  !q || (text ?? '').toLowerCase().includes(q.toLowerCase())
+
+function subtreeMatches(node, q, nodeCache) {
+  if (!q) return true
+  if (matchesLabel(node.label, q)) return true
+  const cache = nodeCache.get(node.id)
+  if (!cache || cache.status !== 'loaded') return false
+  return cache.children.some((child) => subtreeMatches(child, q, nodeCache))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DatabaseExplorer
+//
+// Phase 13 props
+// ──────────────
+//   connections      — ConnectionInfo[] owned by the parent.  When provided,
+//                      the Explorer renders from this list instead of its
+//                      own fetch, which lets the parent refresh the tree the
+//                      moment ConnectionDialog persists a new entry.
+//                      (Undefined = legacy standalone mode, used by tests.)
+//   reloadKey        — bump to force an explicit refresh (also used when the
+//                      parent owns `connections`; the Explorer triggers its
+//                      own loadConnections in that case as a belt-and-braces
+//                      fallback for the legacy mode).
+//   selectedConnId   — highlight this connection row (applied exactly once
+//                      when it changes, so the user can still click around
+//                      to inspect other connections afterwards).
+//   onSelectConn     — fires when the user clicks a connection row in the
+//                      tree so the rest of the app can follow along.
+// ─────────────────────────────────────────────────────────────────────────────
+export default function DatabaseExplorer({
+  connections: externalConnections,
+  reloadKey = 0,
+  selectedConnId,
+  onSelectConn,
+  onNewConnection,
+  onTableOpen,
+  onDatabaseOpen,
+  onDatabaseCopyOpen,
+  onQueryOpen,
+  onConsoleOpen,
+  onPropertiesOpen,
+  onConnectionsChanged,
+  onRedisKeyOpen,
+  onRedisServerOpen,
+  tableUsageTopN = 10,
+}) {
+  const [ownConnections, setOwnConnections] = useState([])
+  const [connLoading,  setConnLoading]  = useState(externalConnections === undefined)
+  const [connError,    setConnError]    = useState('')
+  const [expanded,     setExpanded]     = useState(new Set())
+  const [nodeCache,    setNodeCache]    = useState(new Map()) // nodeId → CacheEntry
+  const [searchQuery,  setSearchQuery]  = useState('')
+  const [selected,     setSelected]     = useState(null)     // nodeId | null
+  // Open-frequency map ("<conn>::<db>::<table>" → {count,lastUsedAt}) used to
+  // float frequently-used tables to the top of the tree. Sourced from
+  // griplite.db (durable across reinstalls); loaded once on mount.
+  const [tableUsage,   setTableUsage]   = useState({})
+
+  // Stable ref so fetchChildren (empty dep-array) can call the latest
+  // onConnectionsChanged without being recreated on every render.
+  const onConnectionsChangedRef = useRef(onConnectionsChanged)
+  useEffect(() => { onConnectionsChangedRef.current = onConnectionsChanged }, [onConnectionsChanged])
+
+  // Load persisted table open-frequency once on mount (from griplite.db).
+  useEffect(() => {
+    let alive = true
+    getTableUsage().then((m) => { if (alive) setTableUsage(m ?? {}) }).catch(() => {})
+    return () => { alive = false }
+  }, [])
+
+  // When the parent supplies `connections`, use that as the source of truth;
+  // otherwise fall back to the component's own fetched list (legacy mode,
+  // plus a graceful degradation path).
+  const connections = externalConnections ?? ownConnections
+
+  // Subset used while `searchQuery` is active — the left search box is meant
+  // to find tables only under live TCP connections, not in saved entries that
+  // the user has not re-opened (connected === false).
+  const connectedConnections = useMemo(
+    () => connections.filter((c) => c.connected),
+    [connections],
+  )
+
+  const searchScope = useMemo(
+    () => databaseScopeFromSelection(selected, connections, selectedConnId),
+    [selected, connections, selectedConnId],
+  )
+  const searchTablesFolderId = tablesFolderIdForScope(searchScope)
+
+  // Tree rows to show: every connection in browse mode, connected-only
+  // while searching (disconnected data sources are hidden for the search UX).
+  const treeConnections = searchQuery ? connectedConnections : connections
+  const connectionKindById = useMemo(
+    () => new Map(connections.map((conn) => [conn.id, conn.kind])),
+    [connections],
+  )
+  const connectionKindByIdRef = useRef(connectionKindById)
+  useEffect(() => { connectionKindByIdRef.current = connectionKindById }, [connectionKindById])
+
+  // Right-click context menu — discriminated by `kind`:
+  //   { kind: 'connection',    x, y, connId, connName }
+  //   { kind: 'tables-folder', x, y, connId, dbName, nodeRef }
+  // (One menu at a time, so a single state slot is enough.)
+  const [contextMenu,     setContextMenu]     = useState(null)
+  const [focusedMenuIdx,  setFocusedMenuIdx]  = useState(-1)
+  const contextMenuRef    = useRef(null)
+  const focusedMenuIdxRef = useRef(-1)
+  const [createDbTarget, setCreateDbTarget] = useState(null)
+  const [createDbBusy, setCreateDbBusy] = useState(false)
+  const [createDbError, setCreateDbError] = useState('')
+  const [createTableTarget, setCreateTableTarget] = useState(null)
+  const [createTableBusy, setCreateTableBusy] = useState(false)
+  const [createTableError, setCreateTableError] = useState('')
+  const [addRedisKeyTarget, setAddRedisKeyTarget] = useState(null)
+  const [addRedisKeyBusy, setAddRedisKeyBusy] = useState(false)
+  const [addRedisKeyError, setAddRedisKeyError] = useState('')
+  const [tableAction, setTableAction] = useState(null)
+  const [tableActionBusy, setTableActionBusy] = useState(false)
+  const [tableActionError, setTableActionError] = useState('')
+  const [indexAction, setIndexAction] = useState(null)
+  const [indexActionBusy, setIndexActionBusy] = useState(false)
+  const [indexActionError, setIndexActionError] = useState('')
+  const [createIndexTarget, setCreateIndexTarget] = useState(null)
+  const [createIndexBusy, setCreateIndexBusy] = useState(false)
+  const [createIndexError, setCreateIndexError] = useState('')
+
+  // Keep the ref in sync so the keydown handler (closure) always reads the
+  // latest index without requiring it to be in the effect's dep array.
+  useEffect(() => { focusedMenuIdxRef.current = focusedMenuIdx }, [focusedMenuIdx])
+
+  // Reset focus whenever a new menu opens.
+  useEffect(() => { setFocusedMenuIdx(-1) }, [contextMenu])
+
+  // Stable ref to nodeCache so callbacks always read the latest version
+  // without re-creating themselves (avoids stale-closure bugs).
+  const nodeCacheRef = useRef(nodeCache)
+  useEffect(() => { nodeCacheRef.current = nodeCache }, [nodeCache])
+
+  // Live "advanced properties" (indexes, DDL, …) cached per collection so a
+  // collection node and its `indexes` sub-folder don't issue duplicate live
+  // round-trips.  Cleared on explicit refresh.
+  const advancedCacheRef = useRef(new Map())
+
+  // ── Auto-collapse disconnected connections ────────────────────────────────
+  //
+  // When a connection transitions from connected→disconnected (detected by
+  // comparing with the previous render's list), we wipe its subtree from
+  // nodeCache and remove it from `expanded`.  This prevents stale database /
+  // table nodes from lingering in the tree after the TCP pool is closed,
+  // which avoids the UX confusion of a tree that looks live but isn't.
+  const prevConnectionsRef = useRef([])
+  useEffect(() => {
+    const prevById = Object.fromEntries(
+      prevConnectionsRef.current.map((c) => [c.id, c]),
+    )
+    const newlyDisconnected = connections.filter(
+      (c) => !c.connected && prevById[c.id]?.connected === true,
+    )
+
+    if (newlyDisconnected.length > 0) {
+      setNodeCache((prev) => {
+        const next = new Map(prev)
+        const drop = (id) => {
+          const entry = next.get(id)
+          next.delete(id)
+          if (entry?.children) entry.children.forEach((ch) => drop(ch.id))
+        }
+        newlyDisconnected.forEach((conn) => drop(connNodeId(conn.id)))
+        return next
+      })
+      setExpanded((prev) => {
+        const next = new Set(prev)
+        newlyDisconnected.forEach((conn) => next.delete(connNodeId(conn.id)))
+        return next
+      })
+    }
+
+    prevConnectionsRef.current = connections
+  }, [connections])
+
+  // ── Auto-expansion for search (Phase 17 / Task 3) ────────────────────────
+  //
+  // When `searchQuery` is non-empty we must keep every ancestor of a matching
+  // node open so the match is actually visible.  We compute a memoised
+  // "autoExpanded" set of nodeIds to union with the user-controlled
+  // `expanded` state.  This keeps the user's collapse/expand choices intact
+  // the moment they clear the search box.
+  //
+  //   effectiveExpanded = expanded ∪ autoExpanded
+  //
+  // We walk every *connected* connection's loaded subtree in nodeCache.  The
+  // walk bails out as soon as a subtree has no match, so the worst case scales
+  // with (# matching subtrees × subtree depth), which is tiny.
+  const autoExpanded = useMemo(() => {
+    const set = new Set()
+    if (!searchQuery || !searchScope?.connId || !searchScope?.dbName) return set
+
+    const nodeInScope = (node) => {
+      if (node.id === connNodeId(searchScope.connId)) return true
+      if (node.id === groupId(searchScope.connId, 'databases')) return true
+      if (node.id === dbNodeId(searchScope.connId, searchScope.dbName)) return true
+      if (node.id === searchTablesFolderId) return true
+      return node.connId === searchScope.connId &&
+        node.dbName === searchScope.dbName &&
+        (node.type === 'table' || node.type === 'column')
+    }
+
+    const visit = (node) => {
+      if (!nodeInScope(node)) return false
+      const cache = nodeCache.get(node.id)
+      if (!cache || cache.status !== 'loaded') return false
+      let anyChildMatches = false
+      for (const child of cache.children) {
+        const childHasMatch = (child.type === 'table' && matchesLabel(child.label, searchQuery)) || visit(child)
+        if (childHasMatch) anyChildMatches = true
+      }
+      if (anyChildMatches) set.add(node.id)
+      return anyChildMatches
+    }
+
+    const root = { id: connNodeId(searchScope.connId) }
+    visit(root)
+    return set
+  }, [searchQuery, nodeCache, searchScope, searchTablesFolderId])
+
+  const isEffectivelyExpanded = useCallback(
+    (nodeId) => expanded.has(nodeId) || autoExpanded.has(nodeId),
+    [expanded, autoExpanded],
+  )
+
+  // Close context menu on outside click; full keyboard navigation when open.
+  useEffect(() => {
+    if (!contextMenu) return
+
+    const close = (e) => {
+      if (contextMenuRef.current && !contextMenuRef.current.contains(e.target)) {
+        setContextMenu(null)
+      }
+    }
+
+    const handleKey = (e) => {
+      // Build items fresh each keystroke so actions are always current.
+      const allItems  = buildMenuItems(contextMenu)
+      const items     = allItems.filter((it) => !it.divider)
+      const len       = items.length
+
+      if (e.key === 'Escape') {
+        setContextMenu(null)
+        return
+      }
+
+      if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        setFocusedMenuIdx((prev) => (prev + 1) % len)
+        return
+      }
+
+      if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        setFocusedMenuIdx((prev) => (prev - 1 + len) % len)
+        return
+      }
+
+      if (e.key === 'Enter') {
+        const idx = focusedMenuIdxRef.current
+        if (idx >= 0 && idx < len) {
+          e.preventDefault()
+          items[idx].action()
+          setContextMenu(null)
+        }
+        return
+      }
+
+      // Shortcut key (letter mnemonic or function key)
+      const matched = items.find(
+        (it) => it.key && it.key.toLowerCase() === e.key.toLowerCase()
+      )
+      if (matched) {
+        e.preventDefault()
+        matched.action()
+        setContextMenu(null)
+      }
+    }
+
+    document.addEventListener('mousedown', close)
+    document.addEventListener('keydown',   handleKey)
+    return () => {
+      document.removeEventListener('mousedown', close)
+      document.removeEventListener('keydown',   handleKey)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [contextMenu])
+
+  // ── Load connections on mount / on reloadKey bump ────────────────────────
+  //
+  // Only fetches when the parent has NOT supplied its own list.  The parent
+  // owns `connections` in the Phase-13 flow, so `loadConnections` mostly
+  // stays idle in production but remains functional for test harnesses and
+  // the manual refresh button in the header.
+  const loadConnections = useCallback(() => {
+    if (externalConnections !== undefined) return undefined
+    let cancelled = false
+    setConnLoading(true)
+    setConnError('')
+
+    listConnections()
+      .then((conns) => {
+        if (!cancelled) setOwnConnections(conns)
+      })
+      .catch((err) => {
+        if (!cancelled) setConnError(String(err))
+      })
+      .finally(() => {
+        if (!cancelled) setConnLoading(false)
+      })
+
+    return () => { cancelled = true }
+  }, [externalConnections])
+
+  useEffect(() => loadConnections(), [loadConnections, reloadKey])
+
+  // ── Sync local "selected" to the parent-controlled selectedConnId ────────
+  //
+  // Whenever the parent changes `selectedConnId` (e.g. after saving a new
+  // connection through ConnectionDialog) the corresponding row should pop
+  // into the highlighted state so the user sees their new entry at a glance.
+  // We drop the sync if the user already has that row selected manually.
+  useEffect(() => {
+    if (!selectedConnId) return
+    const targetId = connNodeId(selectedConnId)
+    setSelected((cur) => (cur === targetId ? cur : targetId))
+  }, [selectedConnId])
+
+  // ── Lazy-fetch children for a node ───────────────────────────────────────
+  //
+  // For most node types only `nodeId`, `type`, and the IDs we need for the
+  // upstream query are required.  We pass the full node so each branch can
+  // pull whatever it needs (folderKind, groupKind, etc.) without long
+  // positional argument lists.
+  const fetchChildren = useCallback(async (node) => {
+    const { id: nodeId, type, connId, dbName, tableName } = node
+
+    // Skip if already fetching or fetched.
+    const existing = nodeCacheRef.current.get(nodeId)
+    if (existing?.status === 'loading' || existing?.status === 'loaded') return
+
+    // Fetch (and memoise) the live advanced properties for a collection so the
+    // `fields`/`indexes` folder counts and the index list reuse one round-trip.
+    const loadAdvancedProps = async (cid, db, tbl) => {
+      const key = `${cid}::${db}::${tbl}`
+      const cached = advancedCacheRef.current.get(key)
+      if (cached) return cached
+      const props = await getTableAdvancedProperties(cid, db, tbl)
+      advancedCacheRef.current.set(key, props)
+      return props
+    }
+
+    let cancelled = false
+
+    setNodeCache((prev) => new Map([...prev, [nodeId, { status: 'loading', children: [], error: '' }]]))
+
+    try {
+      let children = []
+
+      if (type === 'connection') {
+        // Phase 22: a connection now exposes 4 fixed top-level groups that
+        // mirror DBeaver's "navigator".  No backend call here — children are
+        // synthesised locally and lazy-load their own contents on expansion.
+        const connectionKind = node.kind ?? connectionKindByIdRef.current.get(connId) ?? 'mysql'
+        children = groupsForConnectionKind(connectionKind).map((g) => ({
+          id:        groupId(connId, g.kind),
+          type:      'group',
+          groupKind: g.kind,
+          label:     g.label,
+          connId,
+          connectionKind,
+          hasChildren: true,
+        }))
+
+      } else if (type === 'group' && node.groupKind === 'databases') {
+        // Wails encodes Go's `nil` slices as JSON `null`, not `[]`.  Coerce
+        // here so the .map() below never blows up on a server with zero
+        // visible schemas (or a transient permission glitch).
+        const dbs = (await fetchDatabases(connId)) ?? []
+        if (cancelled) return
+        // A successful fetchDatabases proves the connection is alive — refresh
+        // the connection list so the status dot updates immediately.
+        onConnectionsChangedRef.current?.()
+        const connectionKind = node.connectionKind ?? connectionKindByIdRef.current.get(connId) ?? 'mysql'
+        children = dbs.map((db) => ({
+          id: dbNodeId(connId, db), type: 'database', label: db,
+          connId, dbName: db, connectionKind, hasChildren: true,
+        }))
+
+      } else if (type === 'group' && node.groupKind === 'users') {
+        // mysql.user lives in the system schema; we only ask for the columns
+        // we render so the tree stays snappy on busy servers.
+        const sql =
+          'SELECT user, host FROM mysql.user ORDER BY user, host'
+        const result = await runQuery(connId, '', sql)
+        if (cancelled) return
+        if (result?.error) throw new Error(result.error)
+        children = (result.rows ?? []).map((row) => {
+          const user = String(row[0] ?? '')
+          const host = String(row[1] ?? '')
+          return {
+            id:    userNodeId(connId, user, host),
+            type:  'user',
+            label: `${user}@${host}`,
+            connId,
+            user,
+            host,
+            hasChildren: false,
+          }
+        })
+
+      } else if (type === 'group' && node.groupKind === 'administer') {
+        children = ADMIN_ITEMS.map((it) => ({
+          id:    adminId(connId, it.key),
+          type:  'admin',
+          label: it.label,
+          adminKey: it.key,
+          sql:   it.sql,
+          connId,
+          hasChildren: false,
+        }))
+
+      } else if (type === 'group' && node.groupKind === 'sysinfo') {
+        children = SYSINFO_ITEMS.map((it) => ({
+          id:    sysInfoId(connId, it.key),
+          type:  'sysinfo',
+          label: it.label,
+          sysKey: it.key,
+          sql:   it.sql,
+          connId,
+          hasChildren: false,
+        }))
+
+      } else if (type === 'database' && (node.connectionKind ?? connectionKindByIdRef.current.get(connId)) === 'redis') {
+        // Redis "databases" (db0..dbN) expand into a namespace key tree rather
+        // than the SQL folder set.  A single SCAN page is folded by buildKeyTree
+        // into nested folders + leaves, then materialised up-front; folder
+        // expansion later just returns the precomputed `redisChildren`.
+        const dbIndex = dbIndexFromLabel(dbName)
+        const result = (await redisScanKeys(connId, dbIndex, '*')) ?? { keys: [], nextCursor: 0 }
+        if (cancelled) return
+        children = materializeRedisTree(buildKeyTree(result.keys ?? []), connId, dbName)
+        // SCAN can be cursor-paged; surface a (placeholder) "Load more…" leaf so
+        // the user knows the listing is partial.  A real cursor-continue would
+        // need per-node cursor state that the eager-materialise model doesn't
+        // carry, so this stays informational for now.
+        if (result.nextCursor && result.nextCursor !== 0) {
+          children.push({
+            id: `${nodeId}::loadmore`, type: 'sysinfo',
+            label: 'Load more…', connId, hasChildren: false,
+          })
+        }
+
+      } else if (type === 'rediskeyfolder') {
+        // The whole tree was built from the parent database's SCAN page, so a
+        // folder's children are already materialised on the node itself.
+        children = node.redisChildren ?? []
+
+      } else if (type === 'database') {
+        const connectionKind = node.connectionKind ?? connectionKindByIdRef.current.get(connId) ?? 'mysql'
+        // Databases show virtual folder nodes so the tree mirrors DBeaver.
+        children = databaseFoldersForConnectionKind(connectionKind).map((folder) => ({
+          id: `folder::${folder.kind}::${connId}::${dbName}`,
+          type: 'folder',
+          folderKind: folder.kind,
+          label: connectionKind === 'mongodb' && folder.kind === 'tables' ? 'Collections' : folder.label,
+          connId,
+          dbName,
+          hasChildren: true,
+        }))
+
+      } else if (type === 'folder' && node.folderKind === 'tables') {
+        const tables = (await fetchTables(connId, dbName)) ?? []
+        if (cancelled) return
+        children = tables.map((t) => ({
+          id: tableNodeId(connId, dbName, t.name), type: 'table', label: t.name,
+          kind: t.kind, rowCount: t.rowCount, sizeBytes: t.sizeBytes ?? -1,
+          connId, dbName, tableName: t.name, hasChildren: true,
+        }))
+
+      } else if (type === 'folder' && node.folderKind === 'routines') {
+        const routines = (await fetchRoutines(connId, dbName)) ?? []
+        if (cancelled) return
+        children = routines.length === 0
+          ? [{ id: `${node.id}::empty`, type: 'sysinfo', label: 'No procedures or functions', connId, hasChildren: false }]
+          : routines.map((r) => ({
+              id: `routine::${connId}::${dbName}::${r.name}::${r.type}`,
+              type: 'sysinfo',
+              label: `${r.name}${r.type === 'FUNCTION' ? ' ()' : ''}`,
+              connId, dbName,
+              hasChildren: false,
+              sql: r.type === 'FUNCTION'
+                ? `SHOW CREATE FUNCTION \`${dbName}\`.\`${r.name}\``
+                : `SHOW CREATE PROCEDURE \`${dbName}\`.\`${r.name}\``,
+            }))
+
+      } else if (type === 'folder' && node.folderKind === 'triggers') {
+        const triggers = (await fetchTriggers(connId, dbName)) ?? []
+        if (cancelled) return
+        children = triggers.length === 0
+          ? [{ id: `${node.id}::empty`, type: 'sysinfo', label: 'No triggers', connId, hasChildren: false }]
+          : triggers.map((t) => ({
+              id: `trigger::${connId}::${dbName}::${t.name}`,
+              type: 'sysinfo',
+              label: `${t.timing} ${t.event} on ${t.name}`,
+              connId, dbName,
+              hasChildren: false,
+              sql: `SHOW CREATE TRIGGER \`${dbName}\`.\`${t.name}\``,
+            }))
+
+      } else if (type === 'folder' && node.folderKind === 'events') {
+        const events = (await fetchEvents(connId, dbName)) ?? []
+        if (cancelled) return
+        children = events.length === 0
+          ? [{ id: `${node.id}::empty`, type: 'sysinfo', label: 'No events', connId, hasChildren: false }]
+          : events.map((e) => ({
+              id: `event::${connId}::${dbName}::${e.name}`,
+              type: 'sysinfo',
+              label: `${e.name} (${e.status})`,
+              connId, dbName,
+              hasChildren: false,
+              sql: `SHOW CREATE EVENT \`${dbName}\`.\`${e.name}\``,
+            }))
+
+      } else if (type === 'table' && node.kind === 'collection') {
+        // MongoDB collections mirror DataGrip: expand into `fields` + `indexes`
+        // sub-folders.  The counts are a best-effort badge — a slow cache read
+        // or live index lookup must NOT block (or fail) the expansion itself,
+        // so each sub-folder still loads its real contents lazily on expand.
+        const [schemaRes, advRes] = await Promise.allSettled([
+          getTableSchema(connId, dbName, tableName),
+          loadAdvancedProps(connId, dbName, tableName),
+        ])
+        if (cancelled) return
+        const fieldCount = schemaRes.status === 'fulfilled' ? (schemaRes.value?.columns ?? []).length : undefined
+        const indexCount = advRes.status === 'fulfilled' ? (advRes.value?.indexes ?? []).length : undefined
+        children = [
+          {
+            id: collFolderId(connId, dbName, tableName, 'fields'),
+            type: 'collfolder', folderKind: 'fields', label: 'fields', count: fieldCount,
+            connId, dbName, tableName, hasChildren: true,
+          },
+          {
+            id: collFolderId(connId, dbName, tableName, 'indexes'),
+            type: 'collfolder', folderKind: 'indexes', label: 'indexes', count: indexCount,
+            connId, dbName, tableName, hasChildren: true,
+          },
+        ]
+
+      } else if (type === 'collfolder' && node.folderKind === 'fields') {
+        const schema = await getTableSchema(connId, dbName, tableName)
+        if (cancelled) return
+        children = (schema.columns ?? []).map((c) => ({
+          id: colNodeId(connId, dbName, tableName, c.name), type: 'column',
+          label: c.name, detail: c.type, isPK: c.isPrimaryKey, nullable: c.nullable,
+          connId, dbName, tableName, hasChildren: false,
+        }))
+
+      } else if (type === 'collfolder' && node.folderKind === 'indexes') {
+        const advanced = await loadAdvancedProps(connId, dbName, tableName)
+        if (cancelled) return
+        children = (advanced?.indexes ?? []).map((ix) => ({
+          id: indexNodeId(connId, dbName, tableName, ix.name),
+          type: 'index', label: ix.name,
+          detail: (ix.columns ?? []).length ? `(${ix.columns.join(', ')})` : '',
+          isPK: !!ix.primary, kind: ix.unique ? 'unique' : '', unique: !!ix.unique,
+          connId, dbName, tableName, hasChildren: false,
+        }))
+
+      } else if (type === 'table') {
+        // Column data comes from the local SQLite cache — sub-millisecond.
+        const schema = await getTableSchema(connId, dbName, tableName)
+        if (cancelled) return
+        children = (schema.columns ?? []).map((c) => ({
+          id: colNodeId(connId, dbName, tableName, c.name), type: 'column',
+          label: c.name, detail: c.type, isPK: c.isPrimaryKey, nullable: c.nullable,
+          connId, dbName, tableName, hasChildren: false,
+        }))
+      }
+
+      if (!cancelled) {
+        setNodeCache((prev) => new Map([...prev, [nodeId, { status: 'loaded', children, error: '' }]]))
+      }
+    } catch (err) {
+      if (!cancelled) {
+        setNodeCache((prev) => new Map([...prev, [nodeId, { status: 'error', children: [], error: normalizeError(err) }]]))
+      }
+    }
+
+    // Cleanup marks this particular fetch as stale so any in-flight Promises
+    // become no-ops (cancelled flag in closure above).
+    return () => { cancelled = true }
+  }, [])
+
+  useEffect(() => {
+    if (!searchQuery || !searchScope?.connId || !searchScope?.dbName) return
+
+    fetchChildren({
+      id: connNodeId(searchScope.connId),
+      type: 'connection',
+      connId: searchScope.connId,
+      hasChildren: true,
+    })
+    fetchChildren({
+      id: groupId(searchScope.connId, 'databases'),
+      type: 'group',
+      groupKind: 'databases',
+      connId: searchScope.connId,
+      hasChildren: true,
+    })
+    fetchChildren({
+      id: dbNodeId(searchScope.connId, searchScope.dbName),
+      type: 'database',
+      connId: searchScope.connId,
+      dbName: searchScope.dbName,
+      hasChildren: true,
+    })
+    fetchChildren({
+      id: searchTablesFolderId,
+      type: 'folder',
+      folderKind: 'tables',
+      connId: searchScope.connId,
+      dbName: searchScope.dbName,
+      hasChildren: true,
+    })
+  }, [fetchChildren, searchQuery, searchScope, searchTablesFolderId])
+
+  // ── Toggle expand / collapse ──────────────────────────────────────────────
+  const toggleExpand = useCallback((node) => {
+    if (!node.hasChildren) return
+
+    const isOpen = expanded.has(node.id)
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      isOpen ? next.delete(node.id) : next.add(node.id)
+      return next
+    })
+
+    if (!isOpen) {
+      fetchChildren(node)
+    }
+  }, [expanded, fetchChildren])
+
+  // ── Refresh a specific node ───────────────────────────────────────────────
+  //
+  // Recursively clears the cache entry for `node` and every loaded
+  // descendant so that re-fetching the root really does rebuild the whole
+  // visible subtree (otherwise stale `databases` / `tables` children would
+  // linger and the user would see no effect from the refresh).
+  const refreshNode = useCallback((node, e) => {
+    e?.stopPropagation?.()
+
+    // Drop any cached live properties so a refresh re-reads indexes from the
+    // server (cheap; the map is small and only holds expanded collections).
+    advancedCacheRef.current.clear()
+
+    setNodeCache((prev) => {
+      const next = new Map(prev)
+      const drop = (id) => {
+        const entry = next.get(id)
+        next.delete(id)
+        if (entry?.children) entry.children.forEach((c) => drop(c.id))
+      }
+      drop(node.id)
+      return next
+    })
+
+    fetchChildren(node)
+  }, [fetchChildren])
+
+  // ── Refresh an entire connection (Phase 22) ───────────────────────────────
+  //
+  // Triggers a backend SyncMetadata crawl AND drops the local tree cache so
+  // the user sees the freshly-pulled databases/tables/columns when the tree
+  // re-expands.  Errors from SyncMetadata are silent — the local refresh
+  // still runs, which is the most-important half of the operation.
+  const refreshConnection = useCallback(async (connId) => {
+    try { await syncMetadata(connId) } catch { /* best-effort */ }
+
+    const root = {
+      id: connNodeId(connId), type: 'connection',
+      connId, hasChildren: true,
+    }
+    refreshNode(root, null)
+    onConnectionsChanged?.()
+  }, [refreshNode, onConnectionsChanged])
+
+  const handleCreateDatabase = useCallback(async ({ databaseName, charset, collation }) => {
+    if (!createDbTarget?.connId) return
+    setCreateDbBusy(true)
+    setCreateDbError('')
+    try {
+      const sql = buildCreateDatabaseSql({ databaseName, charset, collation })
+      const result = await runQuery(createDbTarget.connId, '', sql)
+      if (result?.error) throw new Error(result.error)
+      toast.success(`Created database ${databaseName}`)
+      const node = createDbTarget.nodeRef ?? {
+        id: groupId(createDbTarget.connId, 'databases'),
+        type: 'group',
+        groupKind: 'databases',
+        connId: createDbTarget.connId,
+        hasChildren: true,
+      }
+      setCreateDbTarget(null)
+      refreshNode(node, null)
+      onConnectionsChanged?.()
+    } catch (err) {
+      setCreateDbError(normalizeError(err))
+    } finally {
+      setCreateDbBusy(false)
+    }
+  }, [createDbTarget, onConnectionsChanged, refreshNode])
+
+  const handleCreateTable = useCallback(async ({ tableName, sql }) => {
+    if (!createTableTarget?.connId || !createTableTarget?.dbName) return
+    setCreateTableBusy(true)
+    setCreateTableError('')
+    try {
+      const result = await runQuery(createTableTarget.connId, createTableTarget.dbName, sql)
+      if (result?.error) throw new Error(result.error)
+      try {
+        await refreshTableMetadata(createTableTarget.connId, createTableTarget.dbName, tableName)
+      } catch (err) {
+        console.warn('[explorer] refresh table metadata failed:', err)
+      }
+      toast.success(`Created table ${tableName}`)
+      const node = createTableTarget.nodeRef ?? {
+        id: `folder::tables::${createTableTarget.connId}::${createTableTarget.dbName}`,
+        type: 'folder',
+        folderKind: 'tables',
+        connId: createTableTarget.connId,
+        dbName: createTableTarget.dbName,
+        hasChildren: true,
+      }
+      setCreateTableTarget(null)
+      refreshNode(node, null)
+      onConnectionsChanged?.()
+    } catch (err) {
+      setCreateTableError(normalizeError(err))
+    } finally {
+      setCreateTableBusy(false)
+    }
+  }, [createTableTarget, onConnectionsChanged, refreshNode])
+
+  const refreshTablesFolder = useCallback((connId, dbName) => {
+    refreshNode({
+      id: `folder::tables::${connId}::${dbName}`,
+      type: 'folder',
+      folderKind: 'tables',
+      connId,
+      dbName,
+      hasChildren: true,
+    }, null)
+  }, [refreshNode])
+
+  // ── Create a new Redis key ────────────────────────────────────────────────
+  //
+  // Redis has no empty keys, so each type materialises a placeholder first
+  // value. Afterwards we refresh the owning db node (the whole key tree is
+  // rebuilt on db expansion) and open the new key in a viewer tab.
+  const handleCreateRedisKey = useCallback(async ({ name, type }) => {
+    if (!addRedisKeyTarget?.connId || !addRedisKeyTarget?.dbName) return
+    const { connId, dbName } = addRedisKeyTarget
+    const dbIndex = dbIndexFromLabel(dbName)
+    setAddRedisKeyBusy(true)
+    setAddRedisKeyError('')
+    try {
+      switch (type) {
+        case 'hash':   await redisHashSet(connId, dbIndex, name, 'field', 'value'); break
+        case 'list':   await redisListPush(connId, dbIndex, name, 'value', false); break
+        case 'set':    await redisSetAdd(connId, dbIndex, name, 'member'); break
+        case 'zset':   await redisZAdd(connId, dbIndex, name, 'member', 0); break
+        case 'stream': await redisStreamAdd(connId, dbIndex, name, '*', { field: 'value' }); break
+        case 'string':
+        default:       await redisSetString(connId, dbIndex, name, '', 0); break
+      }
+      toast.success(`Created key ${name}`)
+      setAddRedisKeyTarget(null)
+      refreshNode({
+        id: dbNodeId(connId, dbName),
+        type: 'database',
+        connectionKind: 'redis',
+        connId, dbName,
+        hasChildren: true,
+      }, null)
+      onRedisKeyOpen?.(connId, dbIndex, name)
+    } catch (err) {
+      setAddRedisKeyError(normalizeError(err))
+    } finally {
+      setAddRedisKeyBusy(false)
+    }
+  }, [addRedisKeyTarget, refreshNode, onRedisKeyOpen])
+
+  const handleTableAction = useCallback(async ({ newTableName } = {}) => {
+    if (!tableAction?.connId || !tableAction?.dbName || !tableAction?.tableName) return
+    setTableActionBusy(true)
+    setTableActionError('')
+    try {
+      const { action, connId, dbName, tableName } = tableAction
+      const sql = action === 'rename'
+        ? buildRenameTableSql({ dbName, oldTableName: tableName, newTableName })
+        : buildDropTableSql({ dbName, tableName })
+
+      const result = await runQuery(connId, dbName, sql)
+      if (result?.error) throw new Error(result.error)
+
+      if (action === 'rename') {
+        try { await refreshTableMetadata(connId, dbName, newTableName) } catch { /* best-effort */ }
+        toast.success(`Renamed ${tableName} to ${newTableName}`)
+      } else {
+        toast.success(`Deleted table ${tableName}`)
+      }
+
+      setTableAction(null)
+      refreshTablesFolder(connId, dbName)
+      try { await syncMetadata(connId) } catch { /* best-effort */ }
+      onConnectionsChanged?.()
+    } catch (err) {
+      setTableActionError(normalizeError(err))
+    } finally {
+      setTableActionBusy(false)
+    }
+  }, [onConnectionsChanged, refreshTablesFolder, tableAction])
+
+  // Drop a MongoDB collection index via the shell-style dropIndex command,
+  // then refresh the `indexes` sub-folder so the tree reflects the change.
+  const handleDropIndex = useCallback(async () => {
+    if (!indexAction?.connId || !indexAction?.tableName || !indexAction?.indexName) return
+    setIndexActionBusy(true)
+    setIndexActionError('')
+    try {
+      const { connId, dbName, tableName, indexName } = indexAction
+      const sql = `db.${tableName}.dropIndex(${JSON.stringify(indexName)})`
+      const result = await runQuery(connId, dbName, sql)
+      if (result?.error) throw new Error(result.error)
+      toast.success(`Deleted index ${indexName}`)
+      setIndexAction(null)
+      // Invalidate the cached live properties so the count + list re-read.
+      advancedCacheRef.current.clear()
+      refreshNode({
+        id: collFolderId(connId, dbName, tableName, 'indexes'),
+        type: 'collfolder', folderKind: 'indexes', label: 'indexes',
+        connId, dbName, tableName, hasChildren: true,
+      }, null)
+    } catch (err) {
+      setIndexActionError(normalizeError(err))
+    } finally {
+      setIndexActionBusy(false)
+    }
+  }, [indexAction, refreshNode])
+
+  // Create a MongoDB index from the structured spec produced by the modal,
+  // preserving key order for compound indexes, then refresh the folder.
+  const handleCreateIndex = useCallback(async ({ keys, unique, name } = {}) => {
+    if (!createIndexTarget?.connId || !createIndexTarget?.tableName) return
+    if (!keys || keys.length === 0) return
+    setCreateIndexBusy(true)
+    setCreateIndexError('')
+    try {
+      const { connId, dbName, tableName } = createIndexTarget
+      const keySpec = keys.map((k) => `${JSON.stringify(k.name)}: ${k.dir}`).join(', ')
+      const opts = []
+      if (unique) opts.push('unique: true')
+      if (name) opts.push(`name: ${JSON.stringify(name)}`)
+      const optsArg = opts.length ? `, { ${opts.join(', ')} }` : ''
+      // getCollection(...) tolerates collection names the bare db.<name>
+      // accessor cannot (dots, hyphens, leading digits).
+      const sql = `db.getCollection(${JSON.stringify(tableName)}).createIndex({ ${keySpec} }${optsArg})`
+      const result = await runQuery(connId, dbName, sql)
+      if (result?.error) throw new Error(result.error)
+      toast.success(`Created index on ${tableName}`)
+      setCreateIndexTarget(null)
+      advancedCacheRef.current.clear()
+      refreshNode({
+        id: collFolderId(connId, dbName, tableName, 'indexes'),
+        type: 'collfolder', folderKind: 'indexes', label: 'indexes',
+        connId, dbName, tableName, hasChildren: true,
+      }, null)
+    } catch (err) {
+      setCreateIndexError(normalizeError(err))
+    } finally {
+      setCreateIndexBusy(false)
+    }
+  }, [createIndexTarget, refreshNode])
+
+  // ── Table open handler ────────────────────────────────────────────────────
+  /**
+   * openTable — open (or activate) the table's TableViewer tab.
+   *
+   * @param {object}  node
+   * @param {Event|null} e
+   * @param {'properties'|'data'} [defaultView='properties']
+   *   Pass 'data' when the user wants to jump straight to the query result.
+   */
+  const openTable = useCallback((node, e, defaultView = 'properties') => {
+    e?.stopPropagation()
+    // Optimistically bump in-memory so the tree reorders instantly, then
+    // persist to griplite.db (fire-and-forget) so the ordering survives
+    // restarts and reinstalls.
+    setTableUsage((prev) => bumpTableUsage(prev, { connId: node.connId, dbName: node.dbName, tableName: node.tableName }))
+    recordTableUsage(node.connId, node.dbName, node.tableName)
+    onTableOpen?.({ tableName: node.tableName, dbName: node.dbName, connId: node.connId, defaultView, objectKind: node.kind })
+  }, [onTableOpen])
+
+  // ── Database overview open handler ────────────────────────────────────────
+  const openDatabase = useCallback((node, e) => {
+    e?.stopPropagation()
+    onDatabaseOpen?.({ dbName: node.dbName, connId: node.connId })
+  }, [onDatabaseOpen])
+
+  // ── Read-only query open handler (Phase 22) ───────────────────────────────
+  //
+  // Used for leaves under Users / Administer / System Info.  Each leaf carries
+  // its own SQL plus a stable `key` so the host App can de-duplicate tabs
+  // independently per source (e.g. opening "Session Status" twice activates
+  // the same tab; opening Session + Global creates two).
+  const openQuery = useCallback((node, e) => {
+    e?.stopPropagation?.()
+    if (!onQueryOpen || !node.sql) return
+    onQueryOpen({
+      key:    node.id,                // already unique per (connId, leaf)
+      label:  node.label,
+      sql:    node.sql,
+      connId: node.connId,
+    })
+  }, [onQueryOpen])
+
+  // ── Redis key / server open handlers ──────────────────────────────────────
+  const openRedisKey = useCallback((node, e) => {
+    e?.stopPropagation?.()
+    if (!onRedisKeyOpen) return
+    onRedisKeyOpen(node.connId, dbIndexFromLabel(node.dbName), node.redisKey)
+  }, [onRedisKeyOpen])
+
+  const openRedisServer = useCallback((connId, e) => {
+    e?.stopPropagation?.()
+    onRedisServerOpen?.(connId)
+  }, [onRedisServerOpen])
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Render helpers
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /** Row background + hover style based on selection */
+  const rowCls = (nodeId) => [
+    'flex items-center gap-1 px-2 py-[3px] rounded-sm cursor-pointer select-none group transition-colors',
+    nodeId === selected
+      ? 'bg-active text-fg-primary'
+      : 'hover:bg-hover text-fg-secondary',
+  ].join(' ')
+
+  const searchVisible = (node) => {
+    if (!searchQuery) return true
+    if (node.type === 'connection' || node.type === 'group' || node.type === 'database' || node.type === 'folder' || node.type === 'collfolder') {
+      return true
+    }
+    if (node.type === 'rediskeyfolder') return true
+    if (node.type === 'table' || node.type === 'column' || node.type === 'index' || node.type === 'sysinfo' || node.type === 'admin' || node.type === 'rediskey') {
+      return matchesLabel(node.label, searchQuery)
+    }
+    const cache = nodeCache.get(node.id)
+    if (!cache || cache.status !== 'loaded') return false
+    return cache.children.some((child) => searchVisible(child))
+  }
+
+  // ── Single node row ───────────────────────────────────────────────────────
+  function NodeRow({ node, depth }) {
+    const isOpen     = isEffectivelyExpanded(node.id)
+    const cache      = nodeCache.get(node.id)
+    const isLoading  = cache?.status === 'loading'
+    const isErr      = cache?.status === 'error'
+    const isTable    = node.type === 'table'
+    const isFolder   = node.type === 'folder'
+    const isView     = node.kind === 'view'
+
+    // Visibility rule for search (Phase 17): show the node if its label
+    // matches OR any descendant in the loaded cache matches.  Parents stay
+    // visible as long as the subtree they guard has something to show.
+    if (searchQuery && !searchVisible(node)) return null
+
+    const isLeafQuery = node.type === 'sysinfo' || node.type === 'admin'
+
+    // Phase 14 / Task 2: Split the click semantics for table nodes so the
+    // browser's dblclick heuristic reliably sees two rapid clicks on the same
+    // element.  If single-click also toggles expansion, the row's layout
+    // shifts (children appear/disappear) between clicks and the browser can
+    // abort the dblclick.  For tables we therefore:
+    //   • row onClick         → select only
+    //   • row onDoubleClick   → open Data view
+    //   • arrow span onClick  → toggle expand (explicit & discoverable)
+    // For other node types (connection/database/folder) keeping click=toggle
+    // is fine because they have no "open" action on single click.
+    const handleRowClick = (e) => {
+      // Phase 14 / Task 2: always select on click, whatever the node type
+      setSelected(node.id)
+      // Tables never toggle on single-click; only the arrow does.
+      if (!isTable) {
+        toggleExpand(node)
+      }
+    }
+
+    const handleArrowClick = (e) => {
+      // Only tables route here; for other nodes the outer row handles toggle.
+      e.stopPropagation()
+      toggleExpand(node)
+    }
+
+    // Right-click on database-related nodes pops DBeaver-style actions.
+    const handleContextMenu = (e) => {
+      if (node.type === 'group' && node.groupKind === 'databases') {
+        e.preventDefault()
+        e.stopPropagation()
+        setSelected(node.id)
+        setContextMenu({
+          kind:    'databases-group',
+          x:       e.clientX,
+          y:       e.clientY,
+          connId:  node.connId,
+          nodeRef: node,
+        })
+      } else if (node.type === 'database' && node.connectionKind === 'redis') {
+        e.preventDefault()
+        e.stopPropagation()
+        setSelected(node.id)
+        setContextMenu({
+          kind:    'redis-db',
+          x:       e.clientX,
+          y:       e.clientY,
+          connId:  node.connId,
+          dbName:  node.dbName,
+          prefix:  '',
+          nodeRef: node,
+        })
+      } else if (node.type === 'rediskeyfolder') {
+        e.preventDefault()
+        e.stopPropagation()
+        setSelected(node.id)
+        setContextMenu({
+          kind:    'redis-db',
+          x:       e.clientX,
+          y:       e.clientY,
+          connId:  node.connId,
+          dbName:  node.dbName,
+          prefix:  node.redisPath ? `${node.redisPath}:` : '',
+          nodeRef: node,
+        })
+      } else if ((node.type === 'database' && node.connectionKind !== 'redis') || (isFolder && node.folderKind === 'tables')) {
+        e.preventDefault()
+        e.stopPropagation()
+        setSelected(node.id)
+        setContextMenu({
+          kind:    'database',
+          x:       e.clientX,
+          y:       e.clientY,
+          connId:  node.connId,
+          dbName:  node.dbName,
+          nodeRef: node,
+        })
+      } else if (isTable) {
+        e.preventDefault()
+        e.stopPropagation()
+        setSelected(node.id)
+        setContextMenu({
+          kind:      'table',
+          x:         e.clientX,
+          y:         e.clientY,
+          connId:    node.connId,
+          dbName:    node.dbName,
+          tableName: node.tableName,
+          tableKind: node.kind,
+          nodeRef:   node,
+        })
+      } else if (node.type === 'index') {
+        e.preventDefault()
+        e.stopPropagation()
+        setSelected(node.id)
+        setContextMenu({
+          kind:      'index',
+          x:         e.clientX,
+          y:         e.clientY,
+          connId:    node.connId,
+          dbName:    node.dbName,
+          tableName: node.tableName,
+          indexName: node.label,
+          primary:   node.isPK,
+        })
+      } else if (node.type === 'collfolder' && node.folderKind === 'indexes') {
+        e.preventDefault()
+        e.stopPropagation()
+        setSelected(node.id)
+        setContextMenu({
+          kind:      'indexes-folder',
+          x:         e.clientX,
+          y:         e.clientY,
+          connId:    node.connId,
+          dbName:    node.dbName,
+          tableName: node.tableName,
+          nodeRef:   node,
+        })
+      }
+    }
+
+    return (
+      <div
+        className={rowCls(node.id)}
+        style={{ paddingLeft: `${8 + depth * 14}px` }}
+        onClick={handleRowClick}
+        onContextMenu={handleContextMenu}
+        onDoubleClick={(e) => {
+          // Phase 14 / Task 2: also call preventDefault so the browser does
+          // NOT interpret the second click as a text selection — important
+          // because on some platforms a missed dblclick-to-selection swap
+          // would visibly flash a blue text range inside the tree.
+          e.preventDefault()
+          if (isTable) openTable(node, e, 'data')
+          if (isFolder && node.folderKind === 'tables') openDatabase(node, e)
+          if (isLeafQuery) openQuery(node, e)
+          if (node.type === 'rediskey') openRedisKey(node, e)
+        }}
+      >
+        {/* Expand chevron.  For table nodes the chevron owns its own click
+            handler so single-clicking the row does NOT expand/collapse —
+            only the chevron does.  This keeps dblclick-to-open-data
+            reliable because the row's layout doesn't shift between clicks. */}
+        {node.hasChildren ? (
+          <span
+            className={[
+              'w-3.5 flex items-center justify-center flex-shrink-0 text-fg-muted',
+              isTable ? 'cursor-pointer hover:text-fg-primary' : '',
+            ].join(' ')}
+            onClick={isTable ? handleArrowClick : undefined}
+          >
+            {isLoading ? (
+              <Loader2 size={CHEVRON_SIZE} strokeWidth={2} className="animate-spin" />
+            ) : isOpen ? (
+              <ChevronDown size={CHEVRON_SIZE} strokeWidth={2} />
+            ) : (
+              <ChevronRight size={CHEVRON_SIZE} strokeWidth={2} />
+            )}
+          </span>
+        ) : (
+          <span className="w-3.5 flex-shrink-0" />
+        )}
+
+        {/* Typed icon */}
+        <TreeIcon
+          type={node.type}
+          folderKind={node.folderKind}
+          groupKind={node.groupKind}
+          kind={node.kind}
+          isPK={node.isPK}
+        />
+
+        {/* Label — coloured by node type using theme tokens.  Inline style
+            (rather than utility class) lets a single var() switch the colour
+            cleanly under both light and dark themes. */}
+        <span
+          className="truncate text-[12px] flex-1 min-w-0"
+          style={{ color: labelColorFor(node) }}
+          title={node.label}
+        >
+          {node.label}
+        </span>
+
+        {/* Column type hint */}
+        {node.type === 'column' && node.detail && (
+          <span className="text-[10px] text-fg-muted flex-shrink-0 ml-1 font-mono truncate max-w-[70px]" title={node.detail}>
+            {node.detail}
+          </span>
+        )}
+
+        {/* Collection sub-folder count (fields / indexes) */}
+        {node.type === 'collfolder' && typeof node.count === 'number' && (
+          <span className="text-[11px] text-fg-muted flex-shrink-0 ml-1 tabular-nums select-none">
+            {node.count}
+          </span>
+        )}
+
+        {/* Index key spec + UNIQUE marker */}
+        {node.type === 'index' && (
+          <span className="flex items-center gap-1 flex-shrink-0 ml-1 min-w-0">
+            {(node.isPK || node.kind === 'unique') && (
+              <span className="text-[9px] uppercase tracking-wide select-none" style={{ color: 'var(--syntax-pk)' }}>unique</span>
+            )}
+            {node.detail && (
+              <span className="text-[10px] text-fg-muted font-mono truncate max-w-[160px]" title={node.detail}>
+                {node.detail}
+              </span>
+            )}
+          </span>
+        )}
+
+        {/* Table size badge — always visible, distinct from row count hover hint */}
+        {isTable && (() => {
+          const sizeLabel = formatBytes(node.sizeBytes)
+          return sizeLabel ? (
+            <span
+              className={[
+                'flex-shrink-0 ml-1 px-1 py-px rounded text-[10px] tabular-nums leading-none select-none',
+                'bg-sunken text-fg-muted',
+                // When the row is selected the badge needs to remain readable.
+                node.id === selected
+                  ? 'bg-accent text-fg-on-accent'
+                  : 'group-hover:bg-elevated group-hover:text-fg-secondary',
+              ].join(' ')}
+              title={`Disk size: ${node.sizeBytes.toLocaleString()} bytes`}
+            >
+              {sizeLabel}
+            </span>
+          ) : null
+        })()}
+
+        {/* "Open overview" button on the Tables folder */}
+        {isFolder && node.folderKind === 'tables' && (
+          <button
+            title="Open database overview"
+            onClick={(e) => openDatabase(node, e)}
+            className="flex items-center justify-center w-5 h-5 text-fg-muted hover:text-success
+                       flex-shrink-0 opacity-0 group-hover:opacity-100 ml-1 transition-colors"
+          >
+            <LayoutGrid size={11} strokeWidth={1.8} />
+          </button>
+        )}
+
+        {/* Quick "open Data view" button (table nodes only, Phase 6.9)
+            Visible on hover or when the node is selected. Clicking it is
+            identical to double-clicking the table name: opens the TableViewer
+            directly on the Data tab. e.stopPropagation() prevents the outer
+            onClick from also triggering expand/collapse. */}
+        {isTable && (
+          <button
+            title={node.kind === 'collection' ? 'Open collection data' : 'Open table data'}
+            // Phase 14 / Task 2: stopPropagation prevents the outer row's
+            // onClick / onDoubleClick from firing; preventDefault is a belt
+            // for the rare case where the <button> default behaviour would
+            // interfere (e.g. focus shifts triggering synthetic click events
+            // that the dblclick detector might mis-pair with the row).
+            onClick={(e) => {
+              e.stopPropagation()
+              e.preventDefault()
+              openTable(node, null, 'data')
+            }}
+            onDoubleClick={(e) => {
+              // A fast double-click on the icon itself must not propagate
+              // to the row's onDoubleClick either (which would double-open).
+              e.stopPropagation()
+              e.preventDefault()
+            }}
+            className={[
+              'flex items-center justify-center w-5 h-5 rounded flex-shrink-0 ml-0.5',
+              'transition-all duration-150',
+              'text-fg-muted hover:text-accent hover:bg-hover',
+              // Show when the row is hovered (group-hover) or when selected
+              node.id === selected
+                ? 'opacity-100'
+                : 'opacity-0 group-hover:opacity-100',
+            ].join(' ')}
+          >
+            <LayoutGrid size={12} strokeWidth={1.8} />
+          </button>
+        )}
+
+        {/* Error state */}
+        {isErr && (
+          <span className="text-danger flex-shrink-0 flex items-center" title={cache.error}>
+            <AlertCircle size={STATUS_INDICATOR_SIZE} strokeWidth={2} />
+          </span>
+        )}
+      </div>
+    )
+  }
+
+  // ── Recursive tree renderer ───────────────────────────────────────────────
+  function TreeBranch({ node, depth }) {
+    const isOpen  = isEffectivelyExpanded(node.id)
+    const cache   = nodeCache.get(node.id)
+    if (searchQuery && !searchVisible(node)) return null
+
+    // Float frequently-opened tables to the top — only the tables folder's
+    // children are reordered; every other node type keeps its natural order.
+    const childrenToRender = cache?.children
+      ? (node.type === 'folder' && node.folderKind === 'tables'
+          ? sortTablesByUsage(cache.children, tableUsage, tableUsageTopN)
+          : cache.children)
+      : []
+
+    return (
+      <>
+        <NodeRow node={node} depth={depth} />
+        {isOpen && cache?.status === 'loaded' && childrenToRender.map((child) => (
+          <TreeBranch key={child.id} node={child} depth={depth + 1} />
+        ))}
+        {isOpen && cache?.status === 'loaded' && cache.children.length === 0 && (
+          <div
+            style={{ paddingLeft: `${8 + (depth + 1) * 14}px` }}
+            className="py-0.5 text-[11px] italic text-fg-muted select-none"
+          >
+            (empty)
+          </div>
+        )}
+        {isOpen && cache?.status === 'error' && (
+          <div
+            style={{ paddingLeft: `${8 + (depth + 1) * 14}px` }}
+            className="flex items-center gap-1.5 py-1 text-[11px] text-danger"
+          >
+            <AlertCircle size={STATUS_INDICATOR_SIZE} strokeWidth={2} className="flex-shrink-0" />
+            <span className="truncate">{cache.error}</span>
+            <button
+              onClick={(e) => refreshNode(node, e)}
+              className="ml-1 text-fg-muted hover:text-fg-primary underline"
+            >
+              retry
+            </button>
+          </div>
+        )}
+      </>
+    )
+  }
+
+  // ── Connection node row (has extra connected badge) ───────────────────────
+  function ConnectionRow({ conn }) {
+    const nodeId    = connNodeId(conn.id)
+    const isOpen    = isEffectivelyExpanded(nodeId)
+    const cache     = nodeCache.get(nodeId)
+    const isLoading = cache?.status === 'loading'
+
+    const connLabel = conn.name || `${conn.host}:${conn.port}`
+    const node = {
+      id: nodeId, type: 'connection', label: connLabel,
+      connId: conn.id, kind: conn.kind, hasChildren: true,
+    }
+
+    const handleContextMenu = (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      setContextMenu({ kind: 'connection', x: e.clientX, y: e.clientY, connId: conn.id, connName: conn.name })
+    }
+
+    return (
+      <>
+        <div
+          className={rowCls(nodeId)}
+          style={{ paddingLeft: '8px' }}
+          onClick={() => {
+            setSelected(nodeId)
+            onSelectConn?.(conn.id)
+            toggleExpand(node)
+          }}
+          onContextMenu={handleContextMenu}
+        >
+          <span className="w-3.5 flex items-center justify-center flex-shrink-0 text-fg-muted">
+            {isLoading
+              ? <Loader2 size={CHEVRON_SIZE} strokeWidth={2} className="animate-spin" />
+              : isOpen ? <ChevronDown size={CHEVRON_SIZE} strokeWidth={2} />
+                       : <ChevronRight size={CHEVRON_SIZE} strokeWidth={2} />}
+          </span>
+          <TreeIcon type="connection" kind={conn.kind} />
+          {conn.color && (
+            <span
+              className="w-2.5 h-2.5 rounded-full flex-shrink-0 -ml-0.5 mr-0.5 border border-black/10"
+              style={{ backgroundColor: conn.color }}
+              title={`Color label: ${conn.color}`}
+            />
+          )}
+          <div className="flex-1 flex flex-col min-w-0">
+            <span className="text-[12px] truncate text-fg-primary font-medium">
+              {conn.name || `${conn.host}:${conn.port}`}
+              {conn.readOnly && (
+                <span className="ml-1.5 text-[9px] text-warn bg-warn/10 border border-warn/30 rounded px-1 select-none">RO</span>
+              )}
+            </span>
+            {conn.database && (
+              <span className="text-[10px] text-fg-muted truncate">{conn.database}</span>
+            )}
+          </div>
+          {/* Connected status dot — a plain CSS dot is sharper than any
+              Lucide glyph at this size (≈6px) and stays crisp on HiDPI. */}
+          <span
+            className={[
+              'w-2 h-2 rounded-full flex-shrink-0 ml-1 transition-colors',
+              conn.connected
+                ? 'bg-success shadow-[0_0_4px_rgba(26,127,55,0.4)]'
+                : 'bg-danger',
+            ].join(' ')}
+            title={conn.connected ? 'Connected' : 'Disconnected'}
+          />
+          {/* Refresh button — connection-wide reload (SyncMetadata + tree) */}
+          <button
+            title="Refresh connection"
+            onClick={(e) => { e.stopPropagation(); refreshConnection(conn.id) }}
+            className="flex items-center justify-center text-fg-muted hover:text-fg-primary opacity-0 group-hover:opacity-100 ml-1 transition-colors"
+          >
+            <RotateCw size={11} strokeWidth={2} />
+          </button>
+        </div>
+
+        {isOpen && cache?.status === 'loaded' && cache.children.map((groupNode) => (
+          <TreeBranch key={groupNode.id} node={groupNode} depth={1} />
+        ))}
+        {isOpen && cache?.status === 'error' && (
+          <div className="pl-8 py-1 text-[11px] text-danger flex items-center gap-1.5">
+            <AlertCircle size={STATUS_INDICATOR_SIZE} strokeWidth={2} className="flex-shrink-0" />
+            <span className="truncate">{cache.error}</span>
+            <button onClick={(e) => refreshNode(node, e)} className="ml-1 text-fg-muted hover:text-fg-primary underline">
+              retry
+            </button>
+          </div>
+        )}
+      </>
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Main render
+  // ─────────────────────────────────────────────────────────────────────────
+  return (
+    <div className="flex flex-col h-full bg-sunken border-r border-line-subtle overflow-hidden">
+
+      {/* ── Header ───────────────────────────────────────────────────── */}
+      <div className="flex items-center gap-1 px-2 py-2 border-b border-line-subtle flex-shrink-0">
+        <span className="text-[11px] font-semibold text-fg-muted uppercase tracking-wider flex-1 select-none">
+          Explorer
+        </span>
+        {/* New connection button */}
+        <button
+          title="New connection…"
+          onClick={() => onNewConnection?.()}
+          className="flex items-center justify-center w-5 h-5 text-fg-muted hover:text-success
+                     hover:bg-hover rounded transition-colors"
+        >
+          <Plus size={13} />
+        </button>
+        <button
+          title="Refresh connections"
+          onClick={() => { setNodeCache(new Map()); loadConnections() }}
+          className="flex items-center justify-center w-5 h-5 text-fg-muted hover:text-fg-primary hover:bg-hover rounded transition-colors"
+        >
+          <RotateCw size={12} strokeWidth={2} />
+        </button>
+      </div>
+
+      {/* ── Search (Phase 17 / Task 3) ───────────────────────────────── */}
+      {/*
+        A sticky search input with a magnifier icon on the left and an
+        optional clear-button on the right.  Typing narrows the tree to
+        matching tables and auto-expands their parent Database / Connection
+        nodes so results are immediately visible.
+      */}
+      <div className="px-2 py-1.5 border-b border-line-subtle flex-shrink-0">
+        <div className="relative">
+          <Search
+            size={12}
+            className="absolute left-2 top-1/2 -translate-y-1/2 text-fg-muted pointer-events-none"
+          />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Escape') setSearchQuery('') }}
+            placeholder="Search tables in connected sources…"
+            title="Only searches under live (connected) sources; saved but disconnected entries are excluded"
+            className="w-full bg-panel text-fg-primary text-[12px] pl-7 pr-7 py-1
+                       rounded border border-line outline-none
+                       placeholder:text-fg-muted focus:border-accent transition-colors"
+          />
+          {searchQuery && (
+            <button
+              title="Clear search (Esc)"
+              onClick={() => setSearchQuery('')}
+              className="absolute right-1.5 top-1/2 -translate-y-1/2
+                         w-4 h-4 flex items-center justify-center
+                         text-fg-muted hover:text-fg-primary hover:bg-hover
+                         rounded transition-colors"
+            >
+              <X size={11} />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* ── Tree body ────────────────────────────────────────────────── */}
+      <div className="flex-1 overflow-y-auto overflow-x-hidden py-1">
+        {connLoading && (
+          <div className="flex items-center gap-2 px-4 py-3 text-[12px] text-fg-muted">
+            <Loader2 size={12} strokeWidth={2} className="animate-spin flex-shrink-0" />
+            <span>Connecting…</span>
+          </div>
+        )}
+
+        {connError && (
+          <div className="px-3 py-2 text-[12px] text-danger">
+            <div className="flex items-start gap-1.5">
+              <AlertCircle size={STATUS_INDICATOR_SIZE} strokeWidth={2} className="flex-shrink-0 mt-[2px]" />
+              <span>{connError}</span>
+            </div>
+            <button onClick={loadConnections} className="mt-1 text-fg-muted hover:text-fg-primary underline text-[11px]">
+              retry
+            </button>
+          </div>
+        )}
+
+        {!connLoading && !connError && connections.length === 0 && (
+          <div className="px-4 py-6 text-[12px] text-fg-muted text-center select-none">
+            <div className="flex justify-center mb-2 opacity-50">
+              <Plug size={28} strokeWidth={1.5} />
+            </div>
+            <div>No connections</div>
+            <div className="text-[11px] mt-1">Add a connection to get started</div>
+          </div>
+        )}
+
+        {treeConnections.map((conn) => (
+          <ConnectionRow key={conn.id} conn={conn} />
+        ))}
+
+        {/*
+          When searching: (1) no connected sources — prompt to connect first;
+          (2) connected but nothing in the loaded cache matches the query.
+        */}
+        {!connLoading && !connError && searchQuery && connections.length > 0
+          && connectedConnections.length === 0 && (
+          <div className="px-4 py-6 text-[12px] text-fg-muted text-center select-none">
+            <Unplug size={20} className="mx-auto mb-2 opacity-50" />
+            <div>No connected data sources</div>
+            <div className="text-[11px] mt-1 text-fg-faint">
+              Connect a source first, then search for its tables here
+            </div>
+          </div>
+        )}
+
+      </div>
+
+      {/* ── Context menu (right-click on connection / database / table) ── */}
+      {contextMenu && (() => {
+        const allItems = buildMenuItems(contextMenu)
+        if (!allItems || allItems.length === 0) return null
+        // Build a flat index of non-divider items so focusedMenuIdx aligns
+        // with the same position the keyboard handler uses.
+        let nonDividerIdx = -1
+        return (
+          <div
+            ref={contextMenuRef}
+            style={{ position: 'fixed', top: contextMenu.y, left: contextMenu.x, zIndex: 9999 }}
+            className="bg-panel border border-line rounded shadow-xl py-1 min-w-[210px] text-[12px]"
+          >
+            {allItems.map((item, i) => {
+              if (item.divider) {
+                return <div key={i} className="border-t border-line-subtle my-1" />
+              }
+              nonDividerIdx++
+              const isFocused = nonDividerIdx === focusedMenuIdx
+              const idx = nonDividerIdx
+              return (
+                <button
+                  key={i}
+                  onClick={() => { item.action(); setContextMenu(null) }}
+                  onMouseEnter={() => setFocusedMenuIdx(idx)}
+                  className={[
+                    'w-full text-left px-3 py-1.5 flex items-center justify-between gap-3 transition-colors',
+                    isFocused
+                      ? 'bg-selected text-fg-on-accent'
+                      : 'text-fg-primary hover:bg-selected hover:text-fg-on-accent',
+                  ].join(' ')}
+                >
+                  <span className="flex-1 truncate">{item.label}</span>
+                  {item.shortcut && (
+                    <kbd className={[
+                      'text-[10px] tabular-nums flex-shrink-0 px-1 py-0.5 rounded border font-mono',
+                      isFocused
+                        ? 'border-white/30 text-white/80 bg-white/10'
+                        : 'border-line text-fg-muted bg-panel',
+                    ].join(' ')}>
+                      {item.shortcut}
+                    </kbd>
+                  )}
+                </button>
+              )
+            })}
+          </div>
+        )
+      })()}
+
+      <CreateDatabaseModal
+        isOpen={!!createDbTarget}
+        isCreating={createDbBusy}
+        error={createDbError}
+        onCancel={() => {
+          if (!createDbBusy) {
+            setCreateDbTarget(null)
+            setCreateDbError('')
+          }
+        }}
+        onCreate={handleCreateDatabase}
+      />
+
+      <CreateTableModal
+        isOpen={!!createTableTarget}
+        dbName={createTableTarget?.dbName ?? ''}
+        isCreating={createTableBusy}
+        error={createTableError}
+        onCancel={() => {
+          if (!createTableBusy) {
+            setCreateTableTarget(null)
+            setCreateTableError('')
+          }
+        }}
+        onCreate={handleCreateTable}
+      />
+
+      <AddRedisKeyModal
+        isOpen={!!addRedisKeyTarget}
+        dbName={addRedisKeyTarget?.dbName ?? ''}
+        prefix={addRedisKeyTarget?.prefix ?? ''}
+        isCreating={addRedisKeyBusy}
+        error={addRedisKeyError}
+        onCancel={() => {
+          if (!addRedisKeyBusy) {
+            setAddRedisKeyTarget(null)
+            setAddRedisKeyError('')
+          }
+        }}
+        onCreate={handleCreateRedisKey}
+      />
+
+      <TableActionModal
+        action={tableAction?.action}
+        target={tableAction}
+        isBusy={tableActionBusy}
+        error={tableActionError}
+        onCancel={() => {
+          if (!tableActionBusy) {
+            setTableAction(null)
+            setTableActionError('')
+          }
+        }}
+        onConfirm={handleTableAction}
+      />
+
+      <IndexActionModal
+        target={indexAction}
+        isBusy={indexActionBusy}
+        error={indexActionError}
+        onCancel={() => {
+          if (!indexActionBusy) {
+            setIndexAction(null)
+            setIndexActionError('')
+          }
+        }}
+        onConfirm={handleDropIndex}
+      />
+
+      <CreateIndexModal
+        target={createIndexTarget}
+        isBusy={createIndexBusy}
+        error={createIndexError}
+        onCancel={() => {
+          if (!createIndexBusy) {
+            setCreateIndexTarget(null)
+            setCreateIndexError('')
+          }
+        }}
+        onConfirm={handleCreateIndex}
+      />
+    </div>
+  )
+
+  // ─── Context-menu item builder ────────────────────────────────────────────
+  // Lives inside the component so it can close over openDatabase, refreshNode,
+  // onConsoleOpen, etc.  Returns an array of { label, action, shortcut? } or
+  // { divider: true }.  Returning [] hides the menu completely.
+  function buildMenuItems(ctx) {
+    if (!ctx) return []
+
+    if (ctx.kind === 'databases-group') {
+      const { connId, nodeRef } = ctx
+      return [
+        {
+          label:    <MenuLabel icon={Plus} text="Create Database..." />,
+          shortcut: 'N', key: 'n',
+          action:   () => setCreateDbTarget({ connId, nodeRef }),
+        },
+        { divider: true },
+        {
+          label:    <MenuLabel icon={RotateCw} text="Refresh" />,
+          shortcut: 'F5', key: 'F5',
+          action:   () => refreshNode(nodeRef ?? {
+            id: groupId(connId, 'databases'),
+            type: 'group',
+            groupKind: 'databases',
+            connId,
+            hasChildren: true,
+          }, null),
+        },
+      ]
+    }
+
+    if (ctx.kind === 'table') {
+      const { connId, dbName, tableName, tableKind, nodeRef } = ctx
+      return [
+        {
+          label:    <MenuLabel icon={ListChecks} text="View Table" />,
+          shortcut: 'F4', key: 'F4',
+          action:   () => openTable(nodeRef, null, 'properties'),
+        },
+        {
+          label:    <MenuLabel icon={Pencil} text="Rename Table..." />,
+          key: 'r',
+          action:   () => setTableAction({ action: 'rename', connId, dbName, tableName }),
+        },
+        {
+          label:    <MenuLabel icon={Trash2} text="Delete Table..." />,
+          key: 'x',
+          action:   () => setTableAction({ action: 'delete', connId, dbName, tableName }),
+        },
+        { divider: true },
+        {
+          label:    <MenuLabel icon={Play} text="Export SQL Dump…" />,
+          key: 'd',
+          action:   async () => {
+            try {
+              const { exportDump } = await import('../lib/bridge')
+              const savedPath = await exportDump(connId, dbName, tableName)
+              if (savedPath) {
+                toast.success(`Exported ${tableName}_dump.sql`)
+              }
+            } catch (e) {
+              toast.error(`Dump failed: ${normalizeError(e)}`)
+            }
+          },
+        },
+        {
+          label:    <MenuLabel icon={Play} text="Copy SELECT" />,
+          key: 's',
+          action:   () => onConsoleOpen?.({
+            initialSql: `SELECT * FROM ${quoteSqlIdentifier(dbName)}.${quoteSqlIdentifier(tableName)} LIMIT 100;`,
+            label: `SELECT — ${tableName}`,
+            connId,
+            defaultDb: dbName,
+          }),
+        },
+      ]
+    }
+
+    if (ctx.kind === 'indexes-folder') {
+      const { connId, dbName, tableName, nodeRef } = ctx
+      return [
+        {
+          label:  <MenuLabel icon={Plus} text="Add Index..." />,
+          key: 'n',
+          action: () => setCreateIndexTarget({ connId, dbName, tableName }),
+        },
+        { divider: true },
+        {
+          label:    <MenuLabel icon={RotateCw} text="Refresh" />,
+          shortcut: 'F5', key: 'F5',
+          action:   () => {
+            advancedCacheRef.current.clear()
+            refreshNode(nodeRef ?? {
+              id: collFolderId(connId, dbName, tableName, 'indexes'),
+              type: 'collfolder', folderKind: 'indexes', label: 'indexes',
+              connId, dbName, tableName, hasChildren: true,
+            }, null)
+          },
+        },
+      ]
+    }
+
+    if (ctx.kind === 'index') {
+      const { connId, dbName, tableName, indexName, primary } = ctx
+      return [
+        {
+          label:  <MenuLabel icon={Trash2} text="Delete Index..." />,
+          key: 'x',
+          action: () => setIndexAction({ connId, dbName, tableName, indexName, primary }),
+        },
+      ]
+    }
+
+    if (ctx.kind === 'redis-db') {
+      const { connId, dbName, prefix } = ctx
+      return [
+        {
+          label:    <MenuLabel icon={Plus}     text="New Key…" />,
+          shortcut: 'N', key: 'n',
+          action:   () => { setAddRedisKeyError(''); setAddRedisKeyTarget({ connId, dbName, prefix: prefix ?? '' }) },
+        },
+        { divider: true },
+        {
+          label:    <MenuLabel icon={RotateCw} text="Refresh" />,
+          shortcut: 'F5', key: 'F5',
+          action:   () => refreshNode({
+            id: dbNodeId(connId, dbName),
+            type: 'database',
+            connectionKind: 'redis',
+            connId, dbName,
+            hasChildren: true,
+          }, null),
+        },
+      ]
+    }
+
+    if (ctx.kind === 'database') {
+      const { connId, dbName, nodeRef } = ctx
+      const browseTemplate = `-- Browse ${dbName}\n\n`
+      return [
+        {
+          label:    <MenuLabel icon={Play}       text="Browse from here" />,
+          shortcut: 'B', key: 'b',
+          action:   () => onConsoleOpen?.({ initialSql: browseTemplate, label: `Browse — ${dbName}`, connId, defaultDb: dbName }),
+        },
+        {
+          label:    <MenuLabel icon={ListChecks} text="View Tables" />,
+          shortcut: 'F4', key: 'F4',
+          action:   () => openDatabase({ dbName, connId }, null),
+        },
+        {
+          label:    <MenuLabel icon={Copy} text="Copy Data To..." />,
+          shortcut: 'Y', key: 'y',
+          action:   () => onDatabaseCopyOpen?.({ dbName, connId }),
+        },
+        {
+          label:    <MenuLabel icon={Plus}       text="Create New Table…" />,
+          shortcut: 'N', key: 'n',
+          action:   () => setCreateTableTarget({ connId, dbName, nodeRef }),
+        },
+        { divider: true },
+        {
+          label:    <MenuLabel icon={RotateCw}   text="Refresh" />,
+          shortcut: 'F5', key: 'F5',
+          action:   () => refreshNode(nodeRef ?? {
+            id: `db::${connId}::${dbName}`,
+            type: 'database',
+            connId, dbName, hasChildren: true,
+          }, null),
+        },
+      ]
+    }
+
+    if (ctx.kind === 'connection' || !ctx.kind) {
+      // Resolve the underlying SavedConnection so Connect can hand the
+      // backend the original config to re-establish the pool.
+      const conn = connections.find((c) => c.id === ctx.connId) ?? null
+      const handleConnect = async () => {
+        if (!conn) return
+        try {
+          // Use connectSaved so the backend reads credentials from the secure
+          // local store — ConnectionInfo intentionally omits username/password,
+          // so constructing the config object here would always send empty
+          // credentials and silently fail in the driver layer.
+          await connectSaved(conn.id)
+          toast.success(`Connected to ${conn.name || conn.id}`)
+        } catch (e) {
+          // Never let a rejected Promise fall back into React state as a
+          // raw object — normalize and surface via toast so the tree
+          // keeps rendering.
+          console.error('[explorer] connect failed:', e)
+          toast.error(`Connect failed: ${normalizeError(e)}`)
+        }
+        onConnectionsChanged?.()
+        refreshConnection(conn.id)
+      }
+      const handleDisconnect = async () => {
+        try {
+          await disconnect(ctx.connId)
+          toast.success(`Disconnected`)
+        } catch (e) {
+          toast.error(`Disconnect failed: ${normalizeError(e)}`)
+        }
+        refreshNode({
+          id: connNodeId(ctx.connId), type: 'connection',
+          connId: ctx.connId, hasChildren: true,
+        }, null)
+        onConnectionsChanged?.()
+      }
+      const items = [
+        { label: <MenuLabel icon={Link2}     text="Connect" />,     shortcut: 'C', key: 'c', action: handleConnect },
+        { label: <MenuLabel icon={Unplug}    text="Disconnect" />,  shortcut: 'D', key: 'd', action: handleDisconnect },
+        { divider: true },
+        { label: <MenuLabel icon={RotateCw}  text="Refresh" />,     shortcut: 'F5', key: 'F5', action: () => refreshConnection(ctx.connId) },
+      ]
+      // Redis connections expose a server view (INFO / pub-sub / slowlog / clients).
+      if (conn?.kind === 'redis' && onRedisServerOpen) {
+        items.push(
+          { divider: true },
+          { label: <MenuLabel icon={Server} text="Server Info…" />, shortcut: 'I', key: 'i', action: () => openRedisServer(ctx.connId, null) },
+        )
+      }
+      items.push(
+        { divider: true },
+        { label: <MenuLabel icon={Settings2} text="Properties…" />, shortcut: 'P', key: 'p', action: () => onPropertiesOpen?.(ctx.connId) },
+      )
+      return items
+    }
+
+    return []
+  }
+}
+
