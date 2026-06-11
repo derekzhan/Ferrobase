@@ -37,7 +37,7 @@ pub async fn databases(client: &redis::Client) -> Result<Vec<String>, String> {
         Ok(v) if v.len() == 2 => v[1].parse().unwrap_or(16),
         _ => 16,
     };
-    Ok((0..count).map(|i| i.to_string()).collect())
+    Ok((0..count).map(|i| format!("db{i}")).collect())
 }
 
 pub async fn dbsize(client: &redis::Client, db: i64) -> Result<i64, String> {
@@ -435,12 +435,14 @@ pub async fn subscribe(
         let mut stream = pubsub.on_message();
         while let Some(msg) = stream.next().await {
             let channel = msg.get_channel_name().to_string();
-            let payload: Vec<u8> = msg.get_payload_bytes().to_vec();
+            let payload = String::from_utf8_lossy(msg.get_payload_bytes()).to_string();
+            let pattern = msg.get_pattern().ok().and_then(|p: String| if p.is_empty() { None } else { Some(p) });
             let _ = app.emit(
                 &event,
                 serde_json::json!({
                     "channel": channel,
-                    "payload": b64(&payload),
+                    "pattern": pattern,
+                    "payload": payload,
                 }),
             );
         }
