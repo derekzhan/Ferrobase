@@ -133,8 +133,12 @@ pub async fn dispatch(
 
         // ── Metadata ───────────────────────────────────────────────────────
         "FetchDatabases" => {
-            let pool = state.mysql_pool(&arg_str(a, 0)).await?;
-            ok(mysql::fetch_databases(&pool).await.map_err(|e| e)?)
+            let conn_id = arg_str(a, 0);
+            match state.ensure_live(&conn_id).await? {
+                Backend::MySql(pool) => ok(mysql::fetch_databases(&pool).await?),
+                Backend::Mongo(client) => ok(mongo::list_databases(&client).await?),
+                Backend::Redis(client) => ok(redis_drv::databases(&client).await?),
+            }
         }
         "FetchTables" => fetch_tables(state, arg_str(a, 0), arg_str(a, 1)).await,
         "GetTableSchema" => get_table_schema(state, arg_str(a, 0), arg_str(a, 1), arg_str(a, 2)).await,
@@ -514,8 +518,8 @@ async fn delete_saved_connection(state: &AppState, id: String) -> Result<Value, 
 // ── Metadata helpers ──────────────────────────────────────────────────────────
 
 async fn fetch_tables(state: &AppState, conn_id: String, db: String) -> Result<Value, String> {
-    match state.backend(&conn_id).await {
-        Some(Backend::MySql(pool)) => {
+    match state.ensure_live(&conn_id).await? {
+        Backend::MySql(pool) => {
             let tables = mysql::fetch_tables(&pool, &db).await?;
             // cache for completions
             for t in &tables {
@@ -523,9 +527,8 @@ async fn fetch_tables(state: &AppState, conn_id: String, db: String) -> Result<V
             }
             ok(tables)
         }
-        Some(Backend::Mongo(client)) => ok(mongo::list_collections(&client, &db).await?),
-        Some(Backend::Redis(_)) => ok(Vec::<TableInfo>::new()),
-        None => Err(format!("connection {conn_id} is not open")),
+        Backend::Mongo(client) => ok(mongo::list_collections(&client, &db).await?),
+        Backend::Redis(_) => ok(Vec::<TableInfo>::new()),
     }
 }
 
@@ -557,8 +560,9 @@ async fn refresh_table_metadata(state: &AppState, conn_id: String, db: String, t
 }
 
 async fn mysql_pool_opt(state: &AppState, conn_id: &str) -> Option<sqlx::MySqlPool> {
-    match state.backend(conn_id).await {
-        Some(Backend::MySql(p)) => Some(p),
+    // Lazily (re)open; on failure (server down, etc.) callers fall back to cache.
+    match state.ensure_live(conn_id).await {
+        Ok(Backend::MySql(p)) => Some(p),
         _ => None,
     }
 }
@@ -623,7 +627,7 @@ async fn get_sync_state(state: &AppState, conn_id: String) -> SyncStatus {
 async fn run_query(state: &AppState, query_id: String, conn_id: String, db: String, sql: String) -> Result<Value, String> {
     let started = std::time::Instant::now();
     // MongoDB connections route SQL-console text to the Mongo shell evaluator.
-    if let Some(Backend::Mongo(client)) = state.backend(&conn_id).await {
+    if let Backend::Mongo(client) = state.ensure_live(&conn_id).await? {
         let res = mongo::run_console(&client, &db, &sql).await;
         record_history(state, &conn_id, &db, &sql, started.elapsed().as_millis() as i64, &res.error).await;
         return ok(res);
@@ -646,7 +650,7 @@ async fn run_query(state: &AppState, query_id: String, conn_id: String, db: Stri
 }
 
 async fn run_query_page(state: &AppState, conn_id: String, db: String, sql: String, offset: i64, limit: i64) -> Result<Value, String> {
-    if let Some(Backend::Mongo(client)) = state.backend(&conn_id).await {
+    if let Backend::Mongo(client) = state.ensure_live(&conn_id).await? {
         return ok(mongo::run_console_page(&client, &db, &sql, offset, limit).await);
     }
     let pool = state.mysql_pool(&conn_id).await?;
