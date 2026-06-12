@@ -1,5 +1,5 @@
 /**
- * formatters.js — generic display-formatting utilities for GripLite.
+ * formatters.js — generic display-formatting utilities for Ferrobase.
  *
  * All functions are pure and side-effect-free so they can be used safely
  * in both React render paths and utility contexts.

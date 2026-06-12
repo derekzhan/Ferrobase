@@ -1,4 +1,4 @@
-//! Serde data models that mirror, field-for-field, the JSON shapes the GripLite
+//! Serde data models that mirror, field-for-field, the JSON shapes the Ferrobase
 //! React frontend expects (see frontend/wailsjs/go/models.ts). Input structs are
 //! permissive (`#[serde(default)]`) because a single connection payload may be
 //! marshalled from several Go struct variants on the frontend.

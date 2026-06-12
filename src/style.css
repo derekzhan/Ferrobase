@@ -5,7 +5,7 @@
 /* ──────────────────────────────────────────────────────────────────────────
  * Theme tokens
  *
- * Single source of truth for every surface colour in GripLite.  The naming is
+ * Single source of truth for every surface colour in Ferrobase.  The naming is
  * SEMANTIC — components ask for `bg-panel` (a panel surface) rather than a
  * specific hex, so the same JSX automatically renders correctly under either
  * theme.  The Tailwind config maps each token to a custom utility, e.g.

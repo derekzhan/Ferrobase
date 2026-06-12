@@ -2456,7 +2456,7 @@ function isAutoFilledColumn(extra, columnDefault) {
  *   • Run button + every history row expose `title` with the *full* SQL
  *     that will execute (page-1 LIMIT slice), matching the strip below
  *     when the SQL bar is shown.
- *   • History is loaded/saved by the parent (griplite.db via IPC).
+ *   • History is loaded/saved by the parent (ferrobase.db via IPC).
  *
  * Kept deliberately single-component (and single-file) so the surface
  * matches the rest of TableViewer's internal structure.
@@ -2755,7 +2755,7 @@ function FilterBar({
       {/* History toggle ─────────────────────────────────────────────── */}
       <button
         onClick={() => onToggleHistory(!historyOpen)}
-        title="Filter history (saved in local griplite database)"
+        title="Filter history (saved in local Ferrobase database)"
         className={[
           'flex items-center px-1.5 py-1 rounded transition-colors',
           historyOpen
@@ -2944,7 +2944,7 @@ function DataView({ tableName, dbName, connId, schema, objectKind = 'table' }) {
   //                  commits the draft → whereClause.
   //   history      — per-(connId,dbName,tableName) list of recent non-empty
   //                  WHERE snippets, newest first, dedup, max 20.  Loaded
-  //                  from `data_filter_history` in griplite.db on tab open
+  //                  from `data_filter_history` in ferrobase.db on tab open
   //                  and written back on every successful Run + Clear.
   //   historyOpen  — dropdown visibility; toggled by the ▼ button.
   //   showSqlBar   — collapsible info strip showing the full SQL being sent.
@@ -3199,7 +3199,7 @@ function DataView({ tableName, dbName, connId, schema, objectKind = 'table' }) {
     }
     setHistoryOpen(false)
     setWhereDraft(next) // canonicalise the input box
-    // History: prepend non-empty, dedup, cap at 20, persist to griplite.db.
+    // History: prepend non-empty, dedup, cap at 20, persist to ferrobase.db.
     let nextHistory = history
     if (next) {
       nextHistory = [next, ...history.filter((h) => h !== next)].slice(0, 20)
@@ -3467,7 +3467,7 @@ function DataView({ tableName, dbName, connId, schema, objectKind = 'table' }) {
         countError={countError}
         runButtonTitle={runButtonTitle}
         sqlForWhereClause={sqlForWhere}
-        persistHint="Filter history is saved in your local griplite database and survives restarts."
+        persistHint="Filter history is saved in your local Ferrobase database and survives restarts."
         columns={filterSuggestionColumns}
       />
 
@@ -3659,7 +3659,7 @@ function useTableSchema(connId, dbName, tableName, isActive = true) {
         // are now real server-side values captured during the sync
         // crawl; we prefer them over the mock whenever the cache has a
         // non-empty / non-nil value.  Falling back to the mock keeps old
-        // griplite.db files (pre-migration) rendering gracefully until
+        // ferrobase.db files (pre-migration) rendering gracefully until
         // the next sync completes.
         const mock = getMockSchema(tableName)
         const merged = {

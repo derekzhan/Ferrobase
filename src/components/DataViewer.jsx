@@ -1,5 +1,5 @@
 /**
- * DataViewer.jsx — three-mode result viewer for GripLite.
+ * DataViewer.jsx — three-mode result viewer for Ferrobase.
  *
  * Modes
  * ─────

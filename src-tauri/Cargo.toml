@@ -1,6 +1,6 @@
 [package]
 name = "ferrobase"
-version = "0.2.0"
+version = "0.2.1"
 description = "Ferrobase - Lightweight Cross-Platform Database IDE (MySQL / MongoDB / Redis)"
 authors = ["Ferrobase Contributors"]
 license = "MIT"

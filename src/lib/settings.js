@@ -3,7 +3,7 @@
  *
  * These are non-critical UI preferences (same spirit as the existing page-size
  * and theme preferences). Unlike table *usage* data — which lives in
- * griplite.db so it survives reinstalls — a preference reverting to its
+ * ferrobase.db so it survives reinstalls — a preference reverting to its
  * sensible default after a rare reinstall is harmless, so localStorage is fine.
  *
  * A `storage` argument is injectable so the helpers can be unit-tested without

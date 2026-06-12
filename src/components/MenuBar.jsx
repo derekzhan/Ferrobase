@@ -13,7 +13,7 @@
  *
  * Props
  * ─────
- *   onAbout  — fired when the user selects Help → About GripLite.
+ *   onAbout  — fired when the user selects Help → About Ferrobase.
  */
 import { useEffect, useRef, useState } from 'react'
 
@@ -48,7 +48,7 @@ export default function MenuBar({ onAbout, onDocs, onSettings }) {
       label: 'Help',
       items: [
         { label: 'Keyboard Shortcuts', shortcut: '?', action: () => { onDocs?.(); setOpenMenu(null) } },
-        { label: 'About GripLite',     action: () => { onAbout?.(); setOpenMenu(null) } },
+        { label: 'About Ferrobase',     action: () => { onAbout?.(); setOpenMenu(null) } },
       ],
     },
   ]

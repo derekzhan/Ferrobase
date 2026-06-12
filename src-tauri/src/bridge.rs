@@ -122,7 +122,7 @@ pub async fn dispatch(
         "CancelQuery" => {
             let qid = arg_str(a, 0);
             if let Some(h) = state.query_cancels.lock().await.remove(&qid) {
-                h.abort();
+                h.notify_one();
             }
             Ok(Value::Null)
         }
@@ -147,8 +147,12 @@ pub async fn dispatch(
             Ok(Value::Null)
         }
         "GetTableAdvancedProperties" => {
-            let pool = state.mysql_pool(&arg_str(a, 0)).await?;
-            ok(mysql::advanced_properties(&pool, &arg_str(a, 1), &arg_str(a, 2)).await.map_err(|e| e)?)
+            let conn_id = arg_str(a, 0);
+            match state.ensure_live(&conn_id).await? {
+                Backend::MySql(pool) => ok(mysql::advanced_properties(&pool, &arg_str(a, 1), &arg_str(a, 2)).await?),
+                Backend::Mongo(client) => ok(mongo::advanced_properties(&client, &arg_str(a, 1), &arg_str(a, 2)).await?),
+                Backend::Redis(_) => ok(AdvancedTableProperties::default()),
+            }
         }
         "FetchRoutines" => {
             let pool = state.mysql_pool(&arg_str(a, 0)).await?;
@@ -533,14 +537,20 @@ async fn fetch_tables(state: &AppState, conn_id: String, db: String) -> Result<V
 }
 
 async fn get_table_schema(state: &AppState, conn_id: String, db: String, table: String) -> Result<Value, String> {
-    if let Some(pool) = mysql_pool_opt(state, &conn_id).await {
-        match mysql::get_table_schema(&pool, &conn_id, &db, &table).await {
+    match state.ensure_live(&conn_id).await {
+        Ok(Backend::MySql(pool)) => match mysql::get_table_schema(&pool, &conn_id, &db, &table).await {
             Ok(schema) => {
                 crate::store::replace_columns_meta(&state.store, &conn_id, &db, &table, &schema.columns).await;
                 return ok(schema);
             }
             Err(e) => return Err(e),
+        },
+        Ok(Backend::Mongo(client)) => {
+            if let Ok(schema) = mongo::infer_schema(&client, &conn_id, &db, &table).await {
+                return ok(schema);
+            }
         }
+        _ => {}
     }
     // Fallback to cache.
     if let Some(s) = crate::store::cached_table_schema(&state.store, &conn_id, &db, &table).await {
@@ -636,14 +646,17 @@ async fn run_query(state: &AppState, query_id: String, conn_id: String, db: Stri
     let result = if query_id.is_empty() {
         mysql::run_query(pool, db.clone(), sql.clone()).await
     } else {
-        let handle = tokio::spawn(mysql::run_query(pool, db.clone(), sql.clone()));
-        state.query_cancels.lock().await.insert(query_id.clone(), handle.abort_handle());
-        let r = handle.await;
+        // Awaited inline (not spawned): the unprepared `raw_sql` query future is
+        // not `Send + 'static`-general enough for `tokio::spawn`, so we model
+        // cancellation by racing it against a `Notify` and dropping it on cancel.
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        state.query_cancels.lock().await.insert(query_id.clone(), cancel.clone());
+        let r = tokio::select! {
+            r = mysql::run_query(pool, db.clone(), sql.clone()) => r,
+            _ = cancel.notified() => QueryResult { error: "query cancelled".into(), ..Default::default() },
+        };
         state.query_cancels.lock().await.remove(&query_id);
-        match r {
-            Ok(v) => v,
-            Err(_) => QueryResult { error: "query cancelled".into(), ..Default::default() },
-        }
+        r
     };
     record_history(state, &conn_id, &db, &sql, started.elapsed().as_millis() as i64, &result.error).await;
     ok(result)
@@ -702,7 +715,7 @@ fn build_info() -> BuildInfo {
         go_version: format!("rust/{}", "tauri-2"),
         license: "MIT".into(),
         author: "Ferrobase Contributors".into(),
-        email: "".into(),
+        email: "alexzhan037@gmail.com".into(),
         homepage: "https://github.com/derekzhan/Ferrobase".into(),
     }
 }

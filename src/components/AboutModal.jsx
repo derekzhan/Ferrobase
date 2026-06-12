@@ -1,10 +1,10 @@
 /**
- * AboutModal — Phase 18 "Help → About GripLite" dialog.
+ * AboutModal — Phase 18 "Help → About Ferrobase" dialog.
  *
  * Layout
  * ──────
  *   ┌───────────────────────────────────────────────┐
- *   │           ⚡  GripLite                         │
+ *   │           ⚡  Ferrobase                        │
  *   │   Lightweight Cross-Platform Database Client  │
  *   ├───────────────────────────────────────────────┤
  *   │  Version      v0.1.1                          │
@@ -12,7 +12,7 @@
  *   │  Platform     Wails + React / Go              │
  *   │  License      MIT                             │
  *   ├───────────────────────────────────────────────┤
- *   │         GitHub  •  zhanweichun@gmail.com        │
+ *   │         GitHub  •  alexzhan037@gmail.com        │
  *   │                    [ Close ]                  │
  *   └───────────────────────────────────────────────┘
  *
@@ -98,7 +98,7 @@ export default function AboutModal({ isOpen, onClose }) {
             </div>
 
             <h2 className="mt-4 text-[20px] font-semibold text-[color:var(--fg-primary)]">
-              {info?.name ?? 'GripLite'}
+              {info?.name ?? 'Ferrobase'}
             </h2>
             <p className="mt-1 text-[12px] text-[color:var(--fg-muted)] leading-relaxed">
               Lightweight Cross-Platform Database Client

@@ -33,8 +33,11 @@ pub struct AppState {
     pub store: sqlx::SqlitePool,
     /// Absolute path of the local SQLite database.
     pub db_path: String,
-    /// In-flight query cancellation handles keyed by query id.
-    pub query_cancels: Mutex<HashMap<String, AbortHandle>>,
+    /// In-flight query cancellation signals keyed by query id. Notifying the
+    /// handle drops the running query future (it is awaited inline via
+    /// `tokio::select!` rather than spawned, to stay `Send`-compatible with the
+    /// unprepared `raw_sql` query path).
+    pub query_cancels: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
     /// Live Redis pub/sub subscriptions keyed by subscription id.
     pub redis_subs: Mutex<HashMap<String, AbortHandle>>,
     /// Cancellation flag for the currently running copy job.
@@ -67,7 +70,7 @@ impl AppState {
     }
 
     /// Return a live backend, lazily (re)opening it from the saved connection
-    /// store if it is not currently in memory. Mirrors GripLite's `ensureLive`
+    /// store if it is not currently in memory. Mirrors the original `ensureLive`
     /// so metadata/query calls work even before an explicit Connect, and across
     /// app restarts (the in-memory connection map does not survive a restart).
     pub async fn ensure_live(&self, conn_id: &str) -> Result<Backend, String> {

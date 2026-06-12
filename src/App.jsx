@@ -1,5 +1,5 @@
 /**
- * App.jsx — GripLite root component.
+ * App.jsx — Ferrobase root component.
  *
  * Tab model
  * ─────────
@@ -775,11 +775,11 @@ export default function App() {
       */}
       <header
         className="flex items-center h-9 gap-3 flex-shrink-0 bg-titlebar border-b border-line-subtle"
-        style={{ WebkitAppRegion: 'drag', paddingLeft: nativeMenu ? 78 : 12, paddingRight: 12 }}
+        style={{ WebkitAppRegion: 'drag', paddingLeft: 12, paddingRight: 12 }}
       >
         <div className="flex items-center gap-2" style={{ WebkitAppRegion: 'no-drag' }}>
           <span className="text-[13px] font-semibold" style={{ color: 'var(--fg-primary)' }}>
-            GripLite
+            Ferrobase
           </span>
           <span className="text-[11px]" style={{ color: 'var(--fg-muted)' }}>
             — Lightweight Database IDE
@@ -1034,10 +1034,10 @@ export default function App() {
         )}
         <button
           onClick={() => setAboutOpen(true)}
-          title="About GripLite"
+          title="About Ferrobase"
           className="ml-auto text-[11px] opacity-80 hover:opacity-100 transition-opacity cursor-pointer"
         >
-          GripLite {appVersion}
+          Ferrobase {appVersion}
         </button>
       </footer>
 
@@ -1092,7 +1092,7 @@ function WelcomePane({ hasConnections, onNewConsole, onNewConnection }) {
       <div className="max-w-md px-8 text-center">
         <div className="text-[72px] leading-none mb-4 opacity-50">⚡</div>
         <div className="text-[20px] font-semibold mb-1" style={{ color: 'var(--fg-primary)' }}>
-          GripLite
+          Ferrobase
         </div>
         <div className="text-[12px] mb-6" style={{ color: 'var(--fg-muted)' }}>
           Lightweight database IDE — Wails + React

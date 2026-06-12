@@ -71,13 +71,27 @@ async fn open_mysql(cfg: &ConnectionConfig) -> Result<(Backend, String), String>
     Ok((Backend::MySql(pool), version))
 }
 
+/// Hidden advanced-param key used to pick SRV vs standard mode. The literal is
+/// kept for backward compatibility with connections saved by earlier versions.
+const MONGO_MODE_PARAM: &str = "_gripliteMongoConnectionMode";
+
 fn build_mongo_uri(cfg: &ConnectionConfig) -> String {
     // Allow the host field to already be a full connection string.
     let h = cfg.host.trim();
     if h.starts_with("mongodb://") || h.starts_with("mongodb+srv://") {
         return h.to_string();
     }
-    let srv = h.contains("+srv") || cfg.port == 0 && h.contains('.') && !h.contains(':') && cfg.tls;
+    // A hidden advanced param selects SRV vs standard mode.
+    // It must NOT be forwarded as a connection-string option (the Mongo driver
+    // rejects unknown options).
+    let mode_srv = cfg.advanced_params.iter().any(|p| {
+        p.enabled
+            && p.key.eq_ignore_ascii_case(MONGO_MODE_PARAM)
+            && p.value.eq_ignore_ascii_case("srv")
+    });
+    let srv = mode_srv
+        || h.contains("+srv")
+        || (cfg.port == 0 && h.contains('.') && !h.contains(':') && cfg.tls);
     let scheme = if srv { "mongodb+srv" } else { "mongodb" };
 
     let mut auth = String::new();
@@ -104,7 +118,7 @@ fn build_mongo_uri(cfg: &ConnectionConfig) -> String {
         params.push("tls=true".into());
     }
     for p in &cfg.advanced_params {
-        if p.enabled && !p.key.is_empty() {
+        if p.enabled && !p.key.is_empty() && !p.key.eq_ignore_ascii_case(MONGO_MODE_PARAM) {
             params.push(format!("{}={}", p.key, p.value));
         }
     }

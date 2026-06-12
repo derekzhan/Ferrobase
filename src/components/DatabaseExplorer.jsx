@@ -360,7 +360,7 @@ export default function DatabaseExplorer({
   const [selected,     setSelected]     = useState(null)     // nodeId | null
   // Open-frequency map ("<conn>::<db>::<table>" → {count,lastUsedAt}) used to
   // float frequently-used tables to the top of the tree. Sourced from
-  // griplite.db (durable across reinstalls); loaded once on mount.
+  // ferrobase.db (durable across reinstalls); loaded once on mount.
   const [tableUsage,   setTableUsage]   = useState({})
 
   // Stable ref so fetchChildren (empty dep-array) can call the latest
@@ -368,7 +368,7 @@ export default function DatabaseExplorer({
   const onConnectionsChangedRef = useRef(onConnectionsChanged)
   useEffect(() => { onConnectionsChangedRef.current = onConnectionsChanged }, [onConnectionsChanged])
 
-  // Load persisted table open-frequency once on mount (from griplite.db).
+  // Load persisted table open-frequency once on mount (from ferrobase.db).
   useEffect(() => {
     let alive = true
     getTableUsage().then((m) => { if (alive) setTableUsage(m ?? {}) }).catch(() => {})
@@ -1207,7 +1207,7 @@ export default function DatabaseExplorer({
   const openTable = useCallback((node, e, defaultView = 'properties') => {
     e?.stopPropagation()
     // Optimistically bump in-memory so the tree reorders instantly, then
-    // persist to griplite.db (fire-and-forget) so the ordering survives
+    // persist to ferrobase.db (fire-and-forget) so the ordering survives
     // restarts and reinstalls.
     setTableUsage((prev) => bumpTableUsage(prev, { connId: node.connId, dbName: node.dbName, tableName: node.tableName }))
     recordTableUsage(node.connId, node.dbName, node.tableName)

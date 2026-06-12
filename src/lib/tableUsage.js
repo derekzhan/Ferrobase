@@ -2,7 +2,7 @@
  * tableUsage.js — pure helpers for the Database Explorer's "frequently-used
  * tables float to the top" ordering.
  *
- * The authoritative usage data lives in the backend SQLite file (griplite.db)
+ * The authoritative usage data lives in the backend SQLite file (ferrobase.db)
  * via the GetTableUsage / RecordTableUsage IPC calls (see lib/bridge.js), so it
  * survives app reinstalls just like saved connections and query history. The
  * functions here are intentionally storage-free and side-effect-free:

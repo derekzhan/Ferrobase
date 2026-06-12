@@ -1,7 +1,7 @@
 /*
  * Ferrobase — Tauri-backed drop-in replacement for the Wails runtime module.
  *
- * The GripLite frontend imports event/runtime helpers from this module. Instead
+ * The Ferrobase frontend imports event/runtime helpers from this module. Instead
  * of routing through window.runtime (Wails), we map them onto the Tauri v2
  * event system (@tauri-apps/api/event) and a couple of backend bridge calls.
  */

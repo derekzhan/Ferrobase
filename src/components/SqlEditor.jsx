@@ -13,11 +13,11 @@ import {
 import { useTheme } from '../theme/ThemeProvider'
 import RedisConsole from './RedisConsole'
 
-const INITIAL_SQL = `-- GripLite SQL Console
+const INITIAL_SQL = `-- Ferrobase SQL Console
 -- Tip: ⌘+Enter / Ctrl+Enter to run the selected query
 
 `
-const MONGO_INITIAL_SQL = `// GripLite MongoDB Playground
+const MONGO_INITIAL_SQL = `// Ferrobase MongoDB Playground
 // Tip: ⌘+Enter / Ctrl+Enter to run the selected expression
 db.getCollection("prm_order").find({}).limit(100)
 `

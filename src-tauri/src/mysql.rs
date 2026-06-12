@@ -2,9 +2,8 @@
 //! edits + schema alters + copy + dump. Built on sqlx's MySQL driver.
 
 use bigdecimal::BigDecimal;
-use futures::TryStreamExt;
 use serde_json::{Map, Value};
-use sqlx::{Column, Executor, MySqlPool, Row, TypeInfo};
+use sqlx::{Column, MySqlPool, Row, TypeInfo};
 use std::collections::BTreeMap;
 use tauri::{AppHandle, Emitter};
 
@@ -13,6 +12,56 @@ use crate::state::{AppState, Backend};
 use crate::util::{escape_str, json_to_sql_literal, quote_ident};
 
 const MAX_QUERY_ROWS: i64 = 1000;
+
+/// Decode a column as UTF-8 text, tolerating servers (notably MariaDB) that
+/// report `information_schema` string columns with the *binary* charset. sqlx
+/// otherwise refuses to decode those as `String` and `Row::get` panics, which
+/// would crash metadata introspection (listing tables, columns, indexes, …).
+fn s(row: &sqlx::mysql::MySqlRow, idx: usize) -> String {
+    if let Ok(v) = row.try_get::<String, _>(idx) {
+        return v;
+    }
+    match row.try_get::<Vec<u8>, _>(idx) {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
+/// Decode a column as `i64`, tolerating the various numeric representations the
+/// server may use for `information_schema` values (`BIGINT UNSIGNED`, `DECIMAL`,
+/// or even text/binary). Returns 0 when the value is NULL or undecodable.
+fn n(row: &sqlx::mysql::MySqlRow, idx: usize) -> i64 {
+    no(row, idx).unwrap_or(0)
+}
+
+/// Like [`n`] but preserves NULL as `None`.
+fn no(row: &sqlx::mysql::MySqlRow, idx: usize) -> Option<i64> {
+    if let Ok(v) = row.try_get::<Option<i64>, _>(idx) {
+        return v;
+    }
+    if let Ok(v) = row.try_get::<Option<u64>, _>(idx) {
+        return v.map(|x| x as i64);
+    }
+    if let Ok(v) = row.try_get::<Option<i32>, _>(idx) {
+        return v.map(|x| x as i64);
+    }
+    if let Ok(v) = row.try_get::<Option<u32>, _>(idx) {
+        return v.map(|x| x as i64);
+    }
+    if let Ok(v) = row.try_get::<Option<f64>, _>(idx) {
+        return v.map(|x| x as i64);
+    }
+    if let Ok(v) = row.try_get::<Option<BigDecimal>, _>(idx) {
+        return v.map(|x| x.to_string().split('.').next().unwrap_or("0").parse().unwrap_or(0));
+    }
+    if let Ok(v) = row.try_get::<Option<String>, _>(idx) {
+        return v.map(|x| x.trim().parse().unwrap_or(0));
+    }
+    if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(idx) {
+        return v.map(|b| String::from_utf8_lossy(&b).trim().parse().unwrap_or(0));
+    }
+    None
+}
 
 // ── Statement kind detection ──────────────────────────────────────────────────
 
@@ -145,52 +194,34 @@ fn decode_cell(row: &sqlx::mysql::MySqlRow, i: usize) -> Value {
     Value::Null
 }
 
-async fn use_db(conn: &mut sqlx::MySqlConnection, db: &str) -> Result<(), String> {
-    if db.is_empty() {
-        return Ok(());
-    }
-    sqlx::query(&format!("USE {}", quote_ident(db)))
-        .execute(&mut *conn)
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
-}
-
 async fn materialize(
-    conn: &mut sqlx::MySqlConnection,
+    pool: &MySqlPool,
     sql: &str,
     cap: i64,
 ) -> Result<(Vec<ColumnMeta>, Vec<Vec<Value>>, bool), String> {
-    let desc = (&mut *conn).describe(sql).await.map_err(|e| e.to_string())?;
+    // Run the user query via the unprepared *text* (simple-query) protocol.
+    // The prepared/binary protocol rejects many statements a SQL console must
+    // support with MySQL error 1295 ("not supported in the prepared statement
+    // protocol yet"), so we mirror what a CLI client does and avoid preparing.
+    // Executing on the pool (rather than a `&mut Connection`) keeps the future
+    // `Send`, which `raw_sql` + `&mut conn` is not.
+    let fetched = sqlx::raw_sql(sql).fetch_all(pool).await.map_err(|e| e.to_string())?;
     let mut cols: Vec<ColumnMeta> = Vec::new();
-    for (i, c) in desc.columns().iter().enumerate() {
-        cols.push(ColumnMeta {
-            name: c.name().to_string(),
-            type_: c.type_info().name().to_string(),
-            nullable: desc.nullable(i).unwrap_or(true),
-        });
+    if let Some(first) = fetched.first() {
+        for c in first.columns() {
+            cols.push(ColumnMeta {
+                name: c.name().to_string(),
+                type_: c.type_info().name().to_string(),
+                nullable: true,
+            });
+        }
     }
+    let truncated = fetched.len() as i64 > cap;
     let mut rows: Vec<Vec<Value>> = Vec::new();
-    let mut truncated = false;
-    let mut stream = sqlx::query(sql).fetch(&mut *conn);
-    while let Some(row) = stream.try_next().await.map_err(|e| e.to_string())? {
-        if rows.len() as i64 >= cap {
-            truncated = true;
-            break;
-        }
-        // Recompute column meta from the live row if describe gave nothing.
-        if cols.is_empty() {
-            for c in row.columns() {
-                cols.push(ColumnMeta {
-                    name: c.name().to_string(),
-                    type_: c.type_info().name().to_string(),
-                    nullable: true,
-                });
-            }
-        }
+    for row in fetched.iter().take(cap.max(0) as usize) {
         let mut out = Vec::with_capacity(cols.len());
         for i in 0..cols.len() {
-            out.push(decode_cell(&row, i));
+            out.push(decode_cell(row, i));
         }
         rows.push(out);
     }
@@ -200,21 +231,16 @@ async fn materialize(
 pub async fn run_query(pool: MySqlPool, db: String, sql: String) -> QueryResult {
     let start = std::time::Instant::now();
     let mut res = QueryResult::default();
-    let mut conn = match pool.acquire().await {
-        Ok(c) => c,
-        Err(e) => {
-            res.error = e.to_string();
-            return res;
-        }
-    };
-    if let Err(e) = use_db(&mut conn, &db).await {
-        res.error = e;
-        res.exec_ms = start.elapsed().as_millis() as i64;
-        return res;
-    }
     let sql_trim = sql.trim();
+    // Prepend `USE` in the same unprepared batch so the active database applies
+    // to the user statement on the single connection the pool runs it on.
+    let full = if db.trim().is_empty() {
+        sql_trim.to_string()
+    } else {
+        format!("USE {};\n{}", quote_ident(&db), sql_trim)
+    };
     if is_select_like(sql_trim) {
-        match materialize(&mut conn, sql_trim, MAX_QUERY_ROWS).await {
+        match materialize(&pool, &full, MAX_QUERY_ROWS).await {
             Ok((cols, rows, truncated)) => {
                 res.columns = cols;
                 res.row_count = rows.len() as i64;
@@ -224,7 +250,7 @@ pub async fn run_query(pool: MySqlPool, db: String, sql: String) -> QueryResult 
             Err(e) => res.error = e,
         }
     } else {
-        match sqlx::query(sql_trim).execute(&mut *conn).await {
+        match sqlx::raw_sql(&full).execute(&pool).await {
             Ok(r) => res.rows_affected = r.rows_affected() as i64,
             Err(e) => res.error = e.to_string(),
         }
@@ -245,15 +271,8 @@ pub async fn exec_query(pool: &MySqlPool, sql: &str, limit: i64) -> ExecResult {
     let start = std::time::Instant::now();
     let mut res = ExecResult::default();
     let cap = if limit <= 0 { MAX_QUERY_ROWS } else { limit };
-    let mut conn = match pool.acquire().await {
-        Ok(c) => c,
-        Err(e) => {
-            res.error = e.to_string();
-            return res;
-        }
-    };
     if is_select_like(sql) {
-        match materialize(&mut conn, sql.trim(), cap).await {
+        match materialize(pool, sql.trim(), cap).await {
             Ok((cols, rows, truncated)) => {
                 res.columns = cols.into_iter().map(|c| c.name).collect();
                 res.row_count = rows.len() as i64;
@@ -263,7 +282,7 @@ pub async fn exec_query(pool: &MySqlPool, sql: &str, limit: i64) -> ExecResult {
             Err(e) => res.error = e,
         }
     } else {
-        match sqlx::query(sql.trim()).execute(&mut *conn).await {
+        match sqlx::raw_sql(sql.trim()).execute(pool).await {
             Ok(r) => res.rows_affected = r.rows_affected() as i64,
             Err(e) => res.error = e.to_string(),
         }
@@ -278,7 +297,7 @@ pub async fn exec_dml(pool: &MySqlPool, sql: &str) -> ExecResult {
 
 pub async fn kill_query(pool: &MySqlPool, process_id: i64) -> QueryResult {
     let mut res = QueryResult::default();
-    match sqlx::query(&format!("KILL {}", process_id)).execute(pool).await {
+    match sqlx::raw_sql(&format!("KILL {}", process_id)).execute(pool).await {
         Ok(r) => res.rows_affected = r.rows_affected() as i64,
         Err(e) => res.error = e.to_string(),
     }
@@ -292,7 +311,7 @@ pub async fn fetch_databases(pool: &MySqlPool) -> Result<Vec<String>, String> {
         .fetch_all(pool)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(rows.iter().map(|r| r.get::<String, _>(0)).collect())
+    Ok(rows.iter().map(|r| s(r, 0)).collect())
 }
 
 fn charset_from_collation(coll: &str) -> String {
@@ -313,20 +332,20 @@ pub async fn fetch_tables(pool: &MySqlPool, db: &str) -> Result<Vec<TableInfo>, 
 
     let mut out = Vec::new();
     for r in rows {
-        let table_type: String = r.get(1);
+        let table_type = s(&r, 1);
         let kind = if table_type.contains("VIEW") { "view" } else { "table" };
-        let collation: String = r.get(6);
+        let collation = s(&r, 6);
         out.push(TableInfo {
-            name: r.get(0),
+            name: s(&r, 0),
             schema: db.to_string(),
             kind: kind.to_string(),
-            row_count: r.get(3),
-            size_bytes: r.get(4),
-            comment: r.get(5),
-            engine: r.get(2),
+            row_count: n(&r, 3),
+            size_bytes: n(&r, 4),
+            comment: s(&r, 5),
+            engine: s(&r, 2),
             charset: charset_from_collation(&collation),
             collation,
-            auto_increment: r.try_get::<Option<i64>, _>(7).ok().flatten(),
+            auto_increment: no(&r, 7),
         });
     }
     Ok(out)
@@ -345,16 +364,16 @@ pub async fn table_columns(pool: &MySqlPool, db: &str, table: &str) -> Result<Ve
     Ok(rows
         .iter()
         .map(|r| {
-            let nullable: String = r.get(3);
-            let key: String = r.get(4);
+            let nullable = s(r, 3);
+            let key = s(r, 4);
             CachedColumn {
-                ordinal: r.get(0),
-                name: r.get(1),
-                type_: r.get(2),
+                ordinal: n(r, 0),
+                name: s(r, 1),
+                type_: s(r, 2),
                 nullable: nullable.eq_ignore_ascii_case("YES"),
                 is_primary_key: key == "PRI",
-                extra: Some(r.get(5)),
-                comment: Some(r.get(6)),
+                extra: Some(s(r, 5)),
+                comment: Some(s(r, 6)),
             }
         })
         .collect())
@@ -384,16 +403,16 @@ pub async fn get_table_schema(pool: &MySqlPool, conn_id: &str, db: &str, table: 
         ..Default::default()
     };
     if let Some(r) = info {
-        let table_type: String = r.get(0);
+        let table_type = s(&r, 0);
         schema.kind = if table_type.contains("VIEW") { "view".into() } else { "table".into() };
-        schema.engine = r.get(1);
-        schema.row_count = r.get(2);
-        schema.size_bytes = r.get(3);
-        schema.comment = r.get(4);
-        let coll: String = r.get(5);
+        schema.engine = s(&r, 1);
+        schema.row_count = n(&r, 2);
+        schema.size_bytes = n(&r, 3);
+        schema.comment = s(&r, 4);
+        let coll = s(&r, 5);
         schema.charset = charset_from_collation(&coll);
         schema.collation = coll;
-        schema.auto_increment = r.try_get::<Option<i64>, _>(6).ok().flatten();
+        schema.auto_increment = no(&r, 6);
     }
     Ok(schema)
 }
@@ -406,7 +425,7 @@ pub async fn advanced_properties(pool: &MySqlPool, db: &str, table: &str) -> Res
     };
 
     // DDL via SHOW CREATE TABLE
-    if let Ok(row) = sqlx::query(&format!("SHOW CREATE TABLE {}.{}", quote_ident(db), quote_ident(table)))
+    if let Ok(row) = sqlx::raw_sql(&format!("SHOW CREATE TABLE {}.{}", quote_ident(db), quote_ident(table)))
         .fetch_one(pool)
         .await
     {
@@ -427,11 +446,11 @@ pub async fn advanced_properties(pool: &MySqlPool, db: &str, table: &str) -> Res
         let mut map: BTreeMap<String, IndexDetail> = BTreeMap::new();
         let mut order: Vec<String> = Vec::new();
         for r in rows {
-            let name: String = r.get(0);
-            let non_unique: i64 = r.try_get(1).unwrap_or(1);
-            let itype: String = r.get(2);
-            let col: String = r.try_get(3).unwrap_or_default();
-            let comment: String = r.get(5);
+            let name = s(&r, 0);
+            let non_unique: i64 = no(&r, 1).unwrap_or(1);
+            let itype = s(&r, 2);
+            let col = s(&r, 3);
+            let comment = s(&r, 5);
             let entry = map.entry(name.clone()).or_insert_with(|| {
                 order.push(name.clone());
                 IndexDetail {
@@ -468,20 +487,20 @@ pub async fn advanced_properties(pool: &MySqlPool, db: &str, table: &str) -> Res
         let mut map: BTreeMap<String, ForeignKeyDetail> = BTreeMap::new();
         let mut order: Vec<String> = Vec::new();
         for r in rows {
-            let name: String = r.get(0);
+            let name = s(&r, 0);
             let entry = map.entry(name.clone()).or_insert_with(|| {
                 order.push(name.clone());
                 ForeignKeyDetail {
                     name: name.clone(),
-                    ref_schema: r.get(2),
-                    ref_table: r.get(3),
-                    on_delete: r.get(5),
-                    on_update: r.get(6),
+                    ref_schema: s(&r, 2),
+                    ref_table: s(&r, 3),
+                    on_delete: s(&r, 5),
+                    on_update: s(&r, 6),
                     ..Default::default()
                 }
             });
-            entry.columns.push(r.get(1));
-            entry.ref_columns.push(r.get(4));
+            entry.columns.push(s(&r, 1));
+            entry.ref_columns.push(s(&r, 4));
         }
         props.foreign_keys = order.into_iter().filter_map(|k| map.remove(&k)).collect();
     }
@@ -503,20 +522,20 @@ pub async fn advanced_properties(pool: &MySqlPool, db: &str, table: &str) -> Res
         let mut map: BTreeMap<String, ReferenceDetail> = BTreeMap::new();
         let mut order: Vec<String> = Vec::new();
         for r in rows {
-            let name: String = r.get(0);
+            let name = s(&r, 0);
             let entry = map.entry(name.clone()).or_insert_with(|| {
                 order.push(name.clone());
                 ReferenceDetail {
                     name: name.clone(),
-                    from_schema: r.get(1),
-                    from_table: r.get(2),
-                    on_delete: r.get(5),
-                    on_update: r.get(6),
+                    from_schema: s(&r, 1),
+                    from_table: s(&r, 2),
+                    on_delete: s(&r, 5),
+                    on_update: s(&r, 6),
                     ..Default::default()
                 }
             });
-            entry.from_cols.push(r.get(3));
-            entry.to_cols.push(r.get(4));
+            entry.from_cols.push(s(&r, 3));
+            entry.to_cols.push(s(&r, 4));
         }
         props.references = order.into_iter().filter_map(|k| map.remove(&k)).collect();
     }
@@ -538,9 +557,9 @@ pub async fn advanced_properties(pool: &MySqlPool, db: &str, table: &str) -> Res
         let mut map: BTreeMap<String, ConstraintDetail> = BTreeMap::new();
         let mut order: Vec<String> = Vec::new();
         for r in rows {
-            let name: String = r.get(0);
-            let ctype: String = r.get(1);
-            let col: String = r.get(2);
+            let name = s(&r, 0);
+            let ctype = s(&r, 1);
+            let col = s(&r, 2);
             let entry = map.entry(name.clone()).or_insert_with(|| {
                 order.push(name.clone());
                 ConstraintDetail { name: name.clone(), type_: ctype, columns: Vec::new(), expression: String::new() }
@@ -567,11 +586,11 @@ pub async fn advanced_properties(pool: &MySqlPool, db: &str, table: &str) -> Res
     {
         for r in rows {
             props.partitions.push(PartitionDetail {
-                name: r.get(0),
-                method: r.get(1),
-                expression: r.get(2),
-                description: r.get(3),
-                rows: r.get(4),
+                name: s(&r, 0),
+                method: s(&r, 1),
+                expression: s(&r, 2),
+                description: s(&r, 3),
+                rows: n(&r, 4),
             });
         }
     }
@@ -598,10 +617,10 @@ async fn fetch_triggers_for(pool: &MySqlPool, db: &str, table: Option<&str>) -> 
     Ok(rows
         .iter()
         .map(|r| TriggerDetail {
-            name: r.get(0),
-            event: r.get(1),
-            timing: r.get(2),
-            statement: r.get(3),
+            name: s(r, 0),
+            event: s(r, 1),
+            timing: s(r, 2),
+            statement: s(r, 3),
         })
         .collect())
 }
@@ -623,12 +642,12 @@ pub async fn fetch_routines(pool: &MySqlPool, db: &str) -> Result<Vec<RoutineInf
     Ok(rows
         .iter()
         .map(|r| RoutineInfo {
-            name: r.get(0),
-            type_: r.get(1),
-            return_type: r.get(2),
-            comment: r.get(3),
-            created: r.get(4),
-            modified: r.get(5),
+            name: s(r, 0),
+            type_: s(r, 1),
+            return_type: s(r, 2),
+            comment: s(r, 3),
+            created: s(r, 4),
+            modified: s(r, 5),
         })
         .collect())
 }
@@ -646,10 +665,10 @@ pub async fn fetch_events(pool: &MySqlPool, db: &str) -> Result<Vec<EventInfo>, 
     Ok(rows
         .iter()
         .map(|r| {
-            let etype: String = r.get(2);
-            let ival: String = r.get(3);
-            let ifield: String = r.get(4);
-            let exec_at: String = r.get(5);
+            let etype = s(r, 2);
+            let ival = s(r, 3);
+            let ifield = s(r, 4);
+            let exec_at = s(r, 5);
             let schedule = if etype.eq_ignore_ascii_case("ONE TIME") {
                 format!("AT {}", exec_at)
             } else if !ival.is_empty() {
@@ -658,10 +677,10 @@ pub async fn fetch_events(pool: &MySqlPool, db: &str) -> Result<Vec<EventInfo>, 
                 etype.clone()
             };
             EventInfo {
-                name: r.get(0),
-                status: r.get(1),
+                name: s(r, 0),
+                status: s(r, 1),
                 schedule,
-                comment: r.get(6),
+                comment: s(r, 6),
             }
         })
         .collect())
@@ -672,7 +691,7 @@ pub async fn export_dump(pool: &MySqlPool, db: &str, table: &str) -> Result<Stri
     out.push_str(&format!("-- Ferrobase dump of {}.{}\n", db, table));
     out.push_str(&format!("-- Generated: {}\n\n", chrono::Utc::now().to_rfc3339()));
 
-    if let Ok(row) = sqlx::query(&format!("SHOW CREATE TABLE {}.{}", quote_ident(db), quote_ident(table)))
+    if let Ok(row) = sqlx::raw_sql(&format!("SHOW CREATE TABLE {}.{}", quote_ident(db), quote_ident(table)))
         .fetch_one(pool)
         .await
     {
@@ -1067,7 +1086,7 @@ async fn execute_preview(pool: &MySqlPool, preview: SchemaChangePreview) -> Sche
         ..Default::default()
     };
     for (i, stmt) in preview.statements.iter().enumerate() {
-        match sqlx::query(&stmt.sql).execute(pool).await {
+        match sqlx::raw_sql(&stmt.sql).execute(pool).await {
             Ok(_) => result.executed_count += 1,
             Err(e) => {
                 result.success = false;
@@ -1122,25 +1141,28 @@ async fn copy_one_table(
 
     if copy_structure {
         if drop_if_exists {
-            let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {}", dst_ref)).execute(dst).await;
+            let _ = sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {}", dst_ref)).execute(dst).await;
         }
-        let row = sqlx::query(&format!("SHOW CREATE TABLE {}.{}", quote_ident(src_db), quote_ident(src_table)))
+        let row = sqlx::raw_sql(&format!("SHOW CREATE TABLE {}.{}", quote_ident(src_db), quote_ident(src_table)))
             .fetch_one(src)
             .await
             .map_err(|e| e.to_string())?;
         let mut ddl: String = row.try_get(1).unwrap_or_default();
         // Rewrite the table name to the destination table.
         ddl = ddl.replacen(&format!("CREATE TABLE `{}`", src_table), &format!("CREATE TABLE `{}`", dst_table), 1);
-        let _ = sqlx::query(&format!("USE {}", quote_ident(dst_db))).execute(dst).await;
-        sqlx::query(&ddl).execute(dst).await.map_err(|e| e.to_string())?;
+        let _ = sqlx::raw_sql(&format!("USE {}", quote_ident(dst_db))).execute(dst).await;
+        sqlx::raw_sql(&ddl).execute(dst).await.map_err(|e| e.to_string())?;
     }
 
     if copy_data {
         let batch = if batch_size <= 0 { 500 } else { batch_size };
-        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {}.{}", quote_ident(src_db), quote_ident(src_table)))
-            .fetch_one(src)
+        let total: i64 = match sqlx::raw_sql(&format!("SELECT COUNT(*) FROM {}.{}", quote_ident(src_db), quote_ident(src_table)))
+            .fetch_all(src)
             .await
-            .unwrap_or(0);
+        {
+            Ok(rows) => rows.first().map(|r| n(r, 0)).unwrap_or(0),
+            _ => 0,
+        };
         let mut offset: i64 = 0;
         loop {
             if cancel.load(Ordering::SeqCst) {
@@ -1165,7 +1187,7 @@ async fn copy_one_table(
                 values_parts.push(format!("({})", vals.join(", ")));
             }
             let insert = format!("INSERT INTO {} ({}) VALUES {}", dst_ref, cols.join(", "), values_parts.join(", "));
-            sqlx::query(&insert).execute(dst).await.map_err(|e| e.to_string())?;
+            sqlx::raw_sql(&insert).execute(dst).await.map_err(|e| e.to_string())?;
             offset += page.rows.len() as i64;
             emit_progress(app, &format!("Copying {}…", src_table), offset, total);
             if (page.rows.len() as i64) < batch {
@@ -1223,7 +1245,7 @@ pub async fn copy_database(app: AppHandle, state: &AppState, cfg: CopyDatabaseCo
         Err(e) => return CopyResult { success: false, time_ms: 0, error: e },
     };
 
-    let _ = sqlx::query(&format!("CREATE DATABASE IF NOT EXISTS {}", quote_ident(&cfg.target_db)))
+    let _ = sqlx::raw_sql(&format!("CREATE DATABASE IF NOT EXISTS {}", quote_ident(&cfg.target_db)))
         .execute(&dst)
         .await;
 

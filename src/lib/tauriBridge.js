@@ -1,7 +1,7 @@
 /*
  * Ferrobase — Tauri IPC bridge installer.
  *
- * The GripLite frontend talks to its Go backend through the Wails-injected
+ * The Ferrobase frontend talks to its Go backend through the Wails-injected
  * `window.go.main.App.<Method>(...)` object. We polyfill that object with a
  * Proxy so every method call is forwarded to the Rust backend through a single
  * generic Tauri command, `bridge_call(method, args)`. This keeps the entire

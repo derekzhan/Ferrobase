@@ -88,7 +88,7 @@ export async function runQueryPage(connectionID, dbName, sql, offset = 0, limit 
   }
 }
 
-// ─── Data tab WHERE filter history (persisted in griplite.db) ─────────────
+// ─── Data tab WHERE filter history (persisted in ferrobase.db) ─────────────
 const FILTER_HISTORY_LS = 'griplite_data_filter_history_v1'
 
 function filterHistoryKey(connId, dbName, tableName) {
@@ -140,7 +140,7 @@ export async function setDataFilterHistory(connectionID, dbName, tableName, entr
   writeMockFilterHistory(m)
 }
 
-// ─── Table open-frequency (persisted in griplite.db; survives reinstall) ──
+// ─── Table open-frequency (persisted in ferrobase.db; survives reinstall) ──
 const TABLE_USAGE_LS = 'griplite_table_usage_v1'
 
 function readMockTableUsage() {
@@ -155,7 +155,7 @@ function writeMockTableUsage(m) {
 
 /**
  * getTableUsage — load the open-frequency map used to sort the Explorer tree.
- * In the Wails runtime this reads griplite.db (durable across reinstalls); in
+ * In the Wails runtime this reads ferrobase.db (durable across reinstalls); in
  * browser dev it falls back to localStorage.
  *
  * @returns {Promise<Object<string,{count:number,lastUsedAt:number}>>}
@@ -176,7 +176,7 @@ export async function getTableUsage() {
 }
 
 /**
- * recordTableUsage — register one "open" of a table. Persists to griplite.db in
+ * recordTableUsage — register one "open" of a table. Persists to ferrobase.db in
  * the Wails runtime; mirrors into localStorage in browser dev. Fire-and-forget.
  *
  * @param {string} connectionID
@@ -1500,14 +1500,14 @@ export async function getBuildInfo() {
   }
   await delay(10)
   return {
-    name: 'GripLite',
+    name: 'Ferrobase',
     version: 'v0.1.9',
     buildDate: new Date().toISOString().slice(0, 10),
     platform: 'Wails + React (browser preview)',
     goVersion: 'go (dev)',
     license: 'MIT',
     author: 'derek',
-    email: 'zhanweichun@gmail.com',
+    email: 'alexzhan037@gmail.com',
     homepage: 'https://github.com/derekzhan',
   }
 }

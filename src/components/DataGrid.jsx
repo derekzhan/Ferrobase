@@ -1,5 +1,5 @@
 /**
- * DataGrid.jsx — shared canvas data grid primitives for GripLite.
+ * DataGrid.jsx — shared canvas data grid primitives for Ferrobase.
  *
  * Exports:
  *   useGlideTheme     – returns a Glide theme object derived from CSS vars,

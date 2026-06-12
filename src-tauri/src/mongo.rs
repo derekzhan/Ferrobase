@@ -15,20 +15,147 @@ pub async fn list_databases(client: &Client) -> Result<Vec<String>, String> {
 }
 
 pub async fn list_collections(client: &Client, db: &str) -> Result<Vec<TableInfo>, String> {
-    let names = client
-        .database(db)
+    let database = client.database(db);
+    let names = database
         .list_collection_names()
         .await
         .map_err(|e| e.to_string())?;
-    Ok(names
-        .into_iter()
-        .map(|n| TableInfo {
+    let mut out = Vec::with_capacity(names.len());
+    for n in names {
+        // Best-effort document count + storage size for the tree badge. A
+        // failure (e.g. on a view) must not drop the collection from the list.
+        let (row_count, size_bytes) = match database.run_command(doc! { "collStats": &n }).await {
+            Ok(stats) => (bson_i64(&stats, "count"), bson_i64(&stats, "size")),
+            Err(_) => (0, 0),
+        };
+        out.push(TableInfo {
             name: n,
             schema: db.to_string(),
             kind: "collection".into(),
+            row_count,
+            size_bytes,
             ..Default::default()
-        })
-        .collect())
+        });
+    }
+    Ok(out)
+}
+
+fn bson_i64(doc: &Document, key: &str) -> i64 {
+    match doc.get(key) {
+        Some(Bson::Int64(v)) => *v,
+        Some(Bson::Int32(v)) => *v as i64,
+        Some(Bson::Double(v)) => *v as i64,
+        _ => 0,
+    }
+}
+
+/// Infer a pseudo-schema for a collection from a single sample document.
+/// `_id` is always the first column (primary key); remaining top-level keys
+/// follow in document order. Mirrors the original `inferColumns` behaviour.
+pub async fn infer_schema(
+    client: &Client,
+    conn_id: &str,
+    db: &str,
+    coll: &str,
+) -> Result<CachedTableSchema, String> {
+    let c = client.database(db).collection::<Document>(coll);
+    let sample = c.find_one(doc! {}).await.map_err(|e| e.to_string())?;
+
+    let mut columns: Vec<CachedColumn> = Vec::new();
+    let mut ordinal = 1i64;
+    let mut push = |name: &str, ty: String, pk: bool, ord: &mut i64| {
+        columns.push(CachedColumn {
+            ordinal: *ord,
+            name: name.to_string(),
+            type_: ty,
+            nullable: !pk,
+            is_primary_key: pk,
+            extra: None,
+            comment: None,
+        });
+        *ord += 1;
+    };
+
+    match &sample {
+        Some(d) => {
+            let id_ty = d.get("_id").map(bson_type_name).unwrap_or_else(|| "objectId".into());
+            push("_id", id_ty, true, &mut ordinal);
+            for (k, v) in d.iter() {
+                if k == "_id" {
+                    continue;
+                }
+                push(k, bson_type_name(v), false, &mut ordinal);
+            }
+        }
+        None => push("_id", "objectId".into(), true, &mut ordinal),
+    }
+
+    Ok(CachedTableSchema {
+        found: true,
+        conn_id: conn_id.to_string(),
+        db_name: db.to_string(),
+        table_name: coll.to_string(),
+        kind: "collection".into(),
+        row_count: -1,
+        size_bytes: -1,
+        columns,
+        ..Default::default()
+    })
+}
+
+/// List a collection's indexes as `AdvancedTableProperties` (only `indexes` is
+/// populated for MongoDB; DDL/constraints/etc. are not applicable).
+pub async fn advanced_properties(
+    client: &Client,
+    db: &str,
+    coll: &str,
+) -> Result<AdvancedTableProperties, String> {
+    let c = client.database(db).collection::<Document>(coll);
+    let mut cursor = c.list_indexes().await.map_err(|e| e.to_string())?;
+    let mut indexes: Vec<IndexDetail> = Vec::new();
+    while let Some(ix) = cursor.try_next().await.map_err(|e| e.to_string())? {
+        let name = ix.options.as_ref().and_then(|o| o.name.clone()).unwrap_or_default();
+        let unique = ix.options.as_ref().and_then(|o| o.unique).unwrap_or(false);
+        let columns: Vec<String> = ix.keys.keys().cloned().collect();
+        indexes.push(IndexDetail {
+            name,
+            type_: "BTREE".into(),
+            unique,
+            columns,
+            comment: String::new(),
+        });
+    }
+    Ok(AdvancedTableProperties {
+        schema: db.to_string(),
+        table: coll.to_string(),
+        indexes,
+        ..Default::default()
+    })
+}
+
+fn bson_type_name(b: &Bson) -> String {
+    match b {
+        Bson::Double(_) => "double",
+        Bson::String(_) => "string",
+        Bson::Document(_) => "object",
+        Bson::Array(_) => "array",
+        Bson::Boolean(_) => "bool",
+        Bson::Null | Bson::Undefined => "null",
+        Bson::Int32(_) => "int",
+        Bson::Int64(_) => "long",
+        Bson::ObjectId(_) => "objectId",
+        Bson::DateTime(_) => "date",
+        Bson::Decimal128(_) => "decimal",
+        Bson::Binary(_) => "binData",
+        Bson::RegularExpression(_) => "regex",
+        Bson::Timestamp(_) => "timestamp",
+        Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_) => "javascript",
+        Bson::Symbol(_) => "symbol",
+        Bson::MinKey => "minKey",
+        Bson::MaxKey => "maxKey",
+        _ => "mixed",
+    }
+    .to_string()
 }
 
 // ── BSON → JSON cell rendering ───────────────────────────────────────────────
@@ -166,10 +293,19 @@ struct Call {
 
 fn parse_db_expr(expr: &str) -> Option<(String, Vec<Call>)> {
     let s = expr.trim();
-    let s = s.strip_prefix("db.")?;
-    let dot = s.find('.')?;
-    let coll = s[..dot].trim().to_string();
-    let mut rest = s[dot + 1..].trim_start();
+    let s = s.strip_prefix("db")?.trim_start();
+    let s = s.strip_prefix('.')?.trim_start();
+    // Collection handle is either `db.<name>.…` or `db.getCollection("<name>").…`.
+    let (coll, mut rest) = if let Some(after) = s.strip_prefix("getCollection") {
+        let after = after.trim_start();
+        let (inner, after_close) = extract_balanced(after)?;
+        let name = inner.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+        let rest = after_close.trim_start().strip_prefix('.').map(|r| r.trim_start()).unwrap_or("");
+        (name, rest)
+    } else {
+        let dot = s.find('.')?;
+        (s[..dot].trim().to_string(), s[dot + 1..].trim_start())
+    };
     let mut calls = Vec::new();
     while !rest.is_empty() {
         let p = rest.find('(')?;
